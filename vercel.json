@@ -1,10 +1,9 @@
 {
-  "functions": {
-    "api/**/*.py": {
-      "runtime": "python3.12",
-      "maxDuration": 30
-    }
-  },
+  "version": 2,
+  "framework": null,
+  "buildCommand": "echo ok",
+  "installCommand": "echo ok",
+  "outputDirectory": ".",
   "headers": [
     {
       "source": "/api/(.*)",

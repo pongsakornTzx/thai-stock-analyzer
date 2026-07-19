@@ -1,4 +1,5 @@
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 import json
 import time
 import traceback
@@ -10,7 +11,7 @@ except ImportError:
     YF_OK = False
 
 _CACHE: dict = {}
-CACHE_TTL = 90  # seconds — warm Vercel instances share this
+CACHE_TTL = 600
 
 
 def _cache_get(key):
@@ -24,27 +25,31 @@ def _cache_set(key, data):
     _CACHE[key] = {"data": data, "ts": time.time()}
 
 
-def fetch_quote(symbol: str) -> dict:
+def fetch_fundamentals(symbol: str) -> dict:
     cached = _cache_get(symbol)
     if cached:
         return {**cached, "cached": True}
 
-    tk = yf.Ticker(f"{symbol}.BK")
-    fi = tk.fast_info
+    ticker_sym = symbol if symbol.endswith(".BK") else f"{symbol}.BK"
+    tk = yf.Ticker(ticker_sym)
+    info = tk.info
 
-    price = fi.last_price or fi.previous_close or 0
-    prev = fi.previous_close or price
-    change = round(price - prev, 2)
-    change_pct = round((change / prev) * 100, 2) if prev else 0.0
+    def _r(v, digits=2):
+        try:
+            return round(float(v), digits) if v is not None else None
+        except (TypeError, ValueError):
+            return None
 
     data = {
         "symbol": symbol,
-        "price": round(price, 2),
-        "change": change,
-        "change_pct": change_pct,
-        "day_high": round(fi.day_high or price, 2),
-        "day_low": round(fi.day_low or price, 2),
-        "volume": int(fi.shares_outstanding * 0 + (fi.three_month_average_volume or 0)),
+        "pe": _r(info.get("trailingPE")),
+        "pbv": _r(info.get("priceToBook")),
+        "dividend_yield": _r((info.get("dividendYield") or 0) * 100),
+        "eps": _r(info.get("trailingEps")),
+        "market_cap": info.get("marketCap"),
+        "revenue": info.get("totalRevenue"),
+        "debt_to_equity": _r(info.get("debtToEquity")),
+        "roe": _r((info.get("returnOnEquity") or 0) * 100),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+07:00",
                                    time.localtime(time.time() + 7 * 3600)),
         "cached": False,
@@ -60,14 +65,16 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        symbol = self.path.strip("/").split("/")[-1].upper()
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        symbol = (qs.get("symbol", [""])[0] or "").upper().strip().replace(".BK", "")
         if not symbol or not symbol.isalpha():
-            self._json(400, {"error": "invalid symbol"})
+            self._json(400, {"error": "missing or invalid ?symbol= parameter"})
             return
         try:
             if not YF_OK:
                 raise RuntimeError("yfinance not installed")
-            data = fetch_quote(symbol)
+            data = fetch_fundamentals(symbol)
             self._json(200, data)
         except Exception as e:
             self._json(500, {"error": str(e), "trace": traceback.format_exc()[-500:]})
@@ -76,7 +83,7 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Cache-Control", "public, s-maxage=90, stale-while-revalidate=60")
+        self.send_header("Cache-Control", "public, s-maxage=600, stale-while-revalidate=120")
 
     def _json(self, status: int, data: dict):
         body = json.dumps(data, ensure_ascii=False).encode()

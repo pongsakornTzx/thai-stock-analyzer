@@ -1,4 +1,5 @@
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 import json
 import time
 import traceback
@@ -11,7 +12,7 @@ except ImportError:
     YF_OK = False
 
 _CACHE: dict = {}
-CACHE_TTL = 90
+CACHE_TTL = 60
 
 
 def _cache_get(key):
@@ -25,7 +26,7 @@ def _cache_set(key, data):
     _CACHE[key] = {"data": data, "ts": time.time()}
 
 
-def _rsi(series: "pd.Series", period: int = 14) -> float:
+def _rsi(series, period: int = 14) -> float:
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
@@ -35,13 +36,15 @@ def _rsi(series: "pd.Series", period: int = 14) -> float:
     return round(float(val.iloc[-1]), 2) if len(val) else 50.0
 
 
-def _macd(series: "pd.Series"):
+def _macd(series):
     exp12 = series.ewm(span=12, adjust=False).mean()
     exp26 = series.ewm(span=26, adjust=False).mean()
     line = exp12 - exp26
     signal = line.ewm(span=9, adjust=False).mean()
     hist = line - signal
-    return round(float(line.iloc[-1]), 4), round(float(signal.iloc[-1]), 4), round(float(hist.iloc[-1]), 4)
+    return (round(float(line.iloc[-1]), 4),
+            round(float(signal.iloc[-1]), 4),
+            round(float(hist.iloc[-1]), 4))
 
 
 def fetch_indicators(symbol: str) -> dict:
@@ -49,16 +52,16 @@ def fetch_indicators(symbol: str) -> dict:
     if cached:
         return {**cached, "cached": True}
 
-    tk = yf.Ticker(f"{symbol}.BK")
+    ticker_sym = symbol if symbol.endswith(".BK") else f"{symbol}.BK"
+    tk = yf.Ticker(ticker_sym)
     hist = tk.history(period="3mo", interval="1d", auto_adjust=True)
     if hist.empty or len(hist) < 30:
         raise ValueError(f"Not enough history for {symbol}")
 
     close = hist["Close"]
-    rsi = _rsi(close)
+    rsi_val = _rsi(close)
     macd_line, macd_signal, macd_hist = _macd(close)
 
-    # Bollinger Bands (20, 2)
     ma20 = close.rolling(20).mean()
     std20 = close.rolling(20).std()
     bb_upper = round(float((ma20 + 2 * std20).iloc[-1]), 2)
@@ -66,19 +69,30 @@ def fetch_indicators(symbol: str) -> dict:
     bb_lower = round(float((ma20 - 2 * std20).iloc[-1]), 2)
     ma50 = round(float(close.rolling(50).mean().iloc[-1]), 2)
 
-    # Volume ratio vs 20-day avg
     vol = hist["Volume"]
-    vol_ratio = round(float(vol.iloc[-1] / vol.rolling(20).mean().iloc[-1]), 2) if vol.rolling(20).mean().iloc[-1] else 1.0
+    avg20 = vol.rolling(20).mean().iloc[-1]
+    vol_ratio = round(float(vol.iloc[-1] / avg20), 2) if avg20 else 1.0
 
-    # 10-day momentum
     mom = round(float((close.iloc[-1] / close.iloc[-11] - 1) * 100), 2) if len(close) >= 11 else 0.0
+
+    last_price = float(close.iloc[-1])
+    if last_price > ma20.iloc[-1] and macd_hist > 0:
+        trend = "bullish"
+    elif last_price < ma20.iloc[-1] and macd_hist < 0:
+        trend = "bearish"
+    else:
+        trend = "neutral"
+
+    signal_str = "Buy" if rsi_val < 70 and macd_hist > 0 else ("Sell" if rsi_val > 70 or macd_hist < 0 else "Hold")
 
     data = {
         "symbol": symbol,
-        "rsi": rsi,
+        "rsi": rsi_val,
+        "macd": macd_line,
+        "macd_signal": macd_signal,
+        "macd_hist": macd_hist,
         "macd_histogram": macd_hist,
         "macd_line": macd_line,
-        "macd_signal": macd_signal,
         "bb_upper": bb_upper,
         "bb_mid": bb_mid,
         "bb_lower": bb_lower,
@@ -86,6 +100,8 @@ def fetch_indicators(symbol: str) -> dict:
         "ma50": ma50,
         "volume_ratio": vol_ratio,
         "momentum_10d": mom,
+        "trend": trend,
+        "signal": signal_str,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+07:00",
                                    time.localtime(time.time() + 7 * 3600)),
         "cached": False,
@@ -101,9 +117,11 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        symbol = self.path.strip("/").split("/")[-1].upper()
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        symbol = (qs.get("symbol", [""])[0] or "").upper().strip().replace(".BK", "")
         if not symbol or not symbol.isalpha():
-            self._json(400, {"error": "invalid symbol"})
+            self._json(400, {"error": "missing or invalid ?symbol= parameter"})
             return
         try:
             if not YF_OK:
@@ -117,7 +135,7 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Cache-Control", "public, s-maxage=90, stale-while-revalidate=60")
+        self.send_header("Cache-Control", "public, s-maxage=60, stale-while-revalidate=30")
 
     def _json(self, status: int, data: dict):
         body = json.dumps(data, ensure_ascii=False).encode()

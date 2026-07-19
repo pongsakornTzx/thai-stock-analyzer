@@ -1,0 +1,11 @@
+node_modules
+src
+server.ts
+vite.config.ts
+tsconfig.json
+package.json
+package-lock.json
+config
+scripts
+metadata.json
+dist
