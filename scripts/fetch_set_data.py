@@ -1,1 +1,2187 @@
-PLACEHOLDER
+#!/usr/bin/env python3
+"""
+SET Thailand Stock Analysis System
+Data sources (priority order):
+  1. Yahoo Finance (.BK) — อัปเดตอัตโนมัติ ไม่ต้องตั้งค่าอะไร
+  2. Demo data           — fallback สุดท้าย (local dev / network blocked)
+"""
+
+import json
+import os
+from datetime import datetime, timezone, timedelta
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+# ============================================================
+# WATCHLIST — read from config/watchlist.json
+# ============================================================
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "watchlist.json")
+
+_DEFAULT_WATCHLIST = {
+    "PTT":    {"name": "ปตท",              "sector": "พลังงาน"},
+    "KBANK":  {"name": "กสิกรไทย",         "sector": "การเงิน"},
+    "AOT":    {"name": "ท่าอากาศยาน",      "sector": "คมนาคม"},
+    "ADVANC": {"name": "AIS แอดวานซ์",     "sector": "โทรคมนาคม"},
+    "SCB":    {"name": "ไทยพาณิชย์",       "sector": "การเงิน"},
+    "CPALL":  {"name": "ซีพี ออลล์",       "sector": "พาณิชย์"},
+    "GULF":   {"name": "กัลฟ์",            "sector": "พลังงาน"},
+    "BDMS":   {"name": "กรุงเทพดุสิต",     "sector": "สุขภาพ"},
+    "TRUE":   {"name": "ทรู คอร์ปอเรชั่น", "sector": "โทรคมนาคม"},
+    "BBL":    {"name": "กรุงเทพ",          "sector": "การเงิน"},
+}
+
+def load_watchlist() -> dict:
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("stocks", {})
+    except FileNotFoundError:
+        return _DEFAULT_WATCHLIST
+
+WATCHLIST = load_watchlist()
+
+SECTOR_COLORS = {
+    "พลังงาน":    "#f59e0b",
+    "การเงิน":    "#3b82f6",
+    "คมนาคม":     "#8b5cf6",
+    "โทรคมนาคม":  "#06b6d4",
+    "พาณิชย์":    "#10b981",
+    "สุขภาพ":     "#ec4899",
+    "อสังหาฯ":    "#f97316",
+    "อุตสาหกรรม": "#64748b",
+    "เกษตร":      "#84cc16",
+    "เทคโนโลยี":  "#a855f7",
+}
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calc_rsi(series: pd.Series, period: int = 14) -> float:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    val = rsi.dropna().iloc[-1] if not rsi.dropna().empty else 50.0
+    return round(float(val), 2)
+
+def calc_macd(series: pd.Series):
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    histogram = macd_line - signal_line
+    last = lambda s: float(s.dropna().iloc[-1]) if not s.dropna().empty else 0.0
+    return round(last(macd_line), 4), round(last(signal_line), 4), round(last(histogram), 4)
+
+def calc_bollinger(series: pd.Series, period: int = 20):
+    sma = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    upper = sma + 2 * std
+    lower = sma - 2 * std
+    last = lambda s: float(s.dropna().iloc[-1]) if not s.dropna().empty else 0.0
+    return round(last(upper), 2), round(last(sma), 2), round(last(lower), 2)
+
+def calc_volume_ratio(vol: pd.Series, period: int = 20) -> float:
+    avg = vol.rolling(period).mean()
+    ratio = vol / avg
+    val = ratio.dropna().iloc[-1] if not ratio.dropna().empty else 1.0
+    return round(float(val), 2)
+
+def calc_momentum(series: pd.Series, period: int = 10) -> float:
+    if len(series) < period + 1:
+        return 0.0
+    current = series.iloc[-1]
+    past = series.iloc[-period - 1]
+    return round(float((current - past) / past * 100), 2) if past != 0 else 0.0
+
+def calc_ma(series: pd.Series, period: int) -> float:
+    ma = series.rolling(period).mean()
+    val = ma.dropna().iloc[-1] if not ma.dropna().empty else float(series.iloc[-1])
+    return round(float(val), 2)
+
+# ============================================================
+# BACKTEST — วัด win rate ของสัญญาณจากข้อมูลย้อนหลังจริง
+# ============================================================
+
+def backtest_signal(closes: list, hold: int = 5) -> dict:
+    """
+    เดินย้อนหลังในชุดราคา closes แล้วทดสอบ signal แบบง่าย (EMA9 vs EMA21 + RSI)
+    ที่ทุกจุด: ถ้าสัญญาณ Bullish/Bearish → เช็คผลตอบแทน hold วันถัดไปว่าถูกทางไหม
+    คืน win rate, จำนวนเทรด, ผลตอบแทนเฉลี่ย/เทรด
+    """
+    s = pd.Series(closes)
+    if len(s) < 40:
+        return {"win_rate": None, "trades": 0, "avg_return": None, "hold": hold}
+    ema9  = s.ewm(span=9,  adjust=False).mean()
+    ema21 = s.ewm(span=21, adjust=False).mean()
+    delta = s.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    rsi   = 100 - (100 / (1 + rs))
+
+    wins, total, rets = 0, 0, []
+    last = len(s) - hold - 1
+    for i in range(25, last):
+        r = rsi.iloc[i]
+        if pd.isna(r):
+            continue
+        bull = ema9.iloc[i] > ema21.iloc[i] and r >= 50
+        bear = ema9.iloc[i] < ema21.iloc[i] and r <= 50
+        if not (bull or bear):
+            continue
+        fwd = (s.iloc[i + hold] - s.iloc[i]) / s.iloc[i] * 100
+        directional = fwd if bull else -fwd   # กำไรเมื่อทายถูกทาง
+        rets.append(directional)
+        total += 1
+        if directional > 0:
+            wins += 1
+    if total == 0:
+        return {"win_rate": None, "trades": 0, "avg_return": None, "hold": hold}
+    return {
+        "win_rate":   round(wins / total * 100, 1),
+        "trades":     total,
+        "avg_return": round(float(np.mean(rets)), 2),
+        "hold":       hold,
+    }
+
+# ============================================================
+# FUNDAMENTALS — P/E, P/BV, ปันผล, Market Cap (yfinance .info)
+# ============================================================
+
+def fetch_fundamentals(tk) -> dict:
+    """ดึงข้อมูลพื้นฐานจาก yfinance .info (อาจช้า/ไม่ครบ → ใส่ try/except)"""
+    out = {"pe": None, "pbv": None, "div_yield": None, "market_cap": None, "eps": None}
+    try:
+        info = tk.info or {}
+        pe  = info.get("trailingPE") or info.get("forwardPE")
+        pbv = info.get("priceToBook")
+        dy  = info.get("dividendYield")
+        mc  = info.get("marketCap")
+        eps = info.get("trailingEps")
+        out["pe"]         = round(float(pe), 2) if pe else None
+        out["pbv"]        = round(float(pbv), 2) if pbv else None
+        # yfinance คืน dividendYield เป็นสัดส่วน (0.035) หรือ % แล้วแต่เวอร์ชัน → normalize
+        if dy:
+            dy = float(dy)
+            out["div_yield"] = round(dy * 100 if dy < 1 else dy, 2)
+        out["market_cap"] = int(mc) if mc else None
+        out["eps"]        = round(float(eps), 2) if eps else None
+    except Exception as e:
+        print(f"  [Fundamentals] {e}")
+    return out
+
+_EMPTY_FUNDAMENTALS = {"pe": None, "pbv": None, "div_yield": None, "market_cap": None, "eps": None}
+
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
+
+def generate_signals(data: dict) -> dict:
+    signals = []
+    score = 0
+    rsi = data["rsi"]
+    macd_hist = data["macd_histogram"]
+    price = data["price"]
+    bb_upper = data["bb_upper"]
+    bb_lower = data["bb_lower"]
+    bb_mid = data["bb_mid"]
+    vol_ratio = data["volume_ratio"]
+    momentum = data["momentum_10d"]
+    ma20 = data["ma20"]
+    ma50 = data["ma50"]
+
+    if rsi < 30:
+        signals.append({"type": "bullish", "label": "RSI Oversold", "detail": f"RSI={rsi} < 30"})
+        score += 2
+    elif rsi > 70:
+        signals.append({"type": "bearish", "label": "RSI Overbought", "detail": f"RSI={rsi} > 70"})
+        score -= 2
+    else:
+        signals.append({"type": "neutral", "label": "RSI Neutral", "detail": f"RSI={rsi}"})
+
+    if macd_hist > 0:
+        signals.append({"type": "bullish", "label": "MACD+", "detail": f"hist={macd_hist:.4f}"})
+        score += 1
+    else:
+        signals.append({"type": "bearish", "label": "MACD−", "detail": f"hist={macd_hist:.4f}"})
+        score -= 1
+
+    if price <= bb_lower:
+        signals.append({"type": "bullish", "label": "BB Lower", "detail": "ราคาแตะ Lower Band"})
+        score += 2
+    elif price >= bb_upper:
+        signals.append({"type": "bearish", "label": "BB Upper", "detail": "ราคาแตะ Upper Band"})
+        score -= 2
+    elif price > bb_mid:
+        signals.append({"type": "bullish", "label": "BB Mid+", "detail": "เหนือ Midline"})
+        score += 1
+
+    if vol_ratio > 2.0:
+        signals.append({"type": "alert", "label": "Vol Spike", "detail": f"{vol_ratio}x"})
+        score += 1 if momentum > 0 else -1
+    elif vol_ratio > 1.5:
+        signals.append({"type": "alert", "label": "High Vol", "detail": f"{vol_ratio}x"})
+
+    if momentum > 5:
+        signals.append({"type": "bullish", "label": "Mom+", "detail": f"+{momentum}%"})
+        score += 2
+    elif momentum > 2:
+        signals.append({"type": "bullish", "label": "Mom↑", "detail": f"+{momentum}%"})
+        score += 1
+    elif momentum < -5:
+        signals.append({"type": "bearish", "label": "Mom−", "detail": f"{momentum}%"})
+        score -= 2
+    elif momentum < -2:
+        signals.append({"type": "bearish", "label": "Mom↓", "detail": f"{momentum}%"})
+        score -= 1
+
+    if ma20 > ma50 and price > ma20:
+        signals.append({"type": "bullish", "label": "MA↑", "detail": "P>MA20>MA50"})
+        score += 2
+    elif ma20 < ma50 and price < ma20:
+        signals.append({"type": "bearish", "label": "MA↓", "detail": "P<MA20<MA50"})
+        score -= 2
+
+    if score >= 4:
+        verdict, vc = "Strong Buy", "strong-buy"
+    elif score >= 2:
+        verdict, vc = "Buy", "buy"
+    elif score <= -4:
+        verdict, vc = "Strong Sell", "strong-sell"
+    elif score <= -2:
+        verdict, vc = "Sell", "sell"
+    else:
+        verdict, vc = "Hold", "hold"
+
+    return {"signals": signals, "score": score, "verdict": verdict, "verdict_class": vc}
+
+def ai_summary(ticker: str, name: str, data: dict, sig: dict, sector: str = "") -> dict:
+    """3-layer analysis: Macro · Company · Price → Signal + reasons + risk alert."""
+    price     = data["price"]
+    change_pct= data["change_pct"]
+    rsi       = data["rsi"]
+    vol_ratio = data["volume_ratio"]
+    momentum  = data["momentum_10d"]
+    ma20      = data["ma20"]
+    ma50      = data["ma50"]
+    bb_upper  = data["bb_upper"]
+    bb_lower  = data["bb_lower"]
+    bb_mid    = data["bb_mid"]
+    macd_hist = data["macd_histogram"]
+    score     = sig["score"]
+    verdict   = sig["verdict"]
+    vc        = sig["verdict_class"]
+
+    # ── LAYER 1: MACRO (fund flow + sector context + trend) ──────
+    macro_score = 0
+    macro_notes = []
+    SECTOR_MACRO = {
+        "พลังงาน":         "ราคาน้ำมันโลกและนโยบาย OPEC",
+        "การเงิน":         "นโยบายดอกเบี้ย BOT / กำไรสุทธิ NIM",
+        "คมนาคม":          "การฟื้นตัวของการท่องเที่ยวและผู้โดยสาร",
+        "โทรคมนาคม":       "นโยบาย 5G และการแข่งขันในตลาด",
+        "อสังหาริมทรัพย์":  "อัตราดอกเบี้ยและกำลังซื้อผู้บริโภค",
+        "สุขภาพ":          "งบประมาณสาธารณสุขและ Medical Tourism",
+        "พาณิชย์":         "กำลังซื้อในประเทศและ Consumer Confidence",
+        "พลังงานทดแทน":    "นโยบาย EV และเป้าหมาย Net Zero",
+    }
+    if sector in SECTOR_MACRO:
+        macro_notes.append(f"Sensitivity: {SECTOR_MACRO[sector]}")
+    if vol_ratio > 2.0:
+        macro_score += 1
+        macro_notes.append(f"Fund Flow สัญญาณเข้า — Volume {vol_ratio}x เหนือค่าเฉลี่ย")
+    elif vol_ratio < 0.6:
+        macro_score -= 1
+        macro_notes.append(f"Fund Flow อ่อนแอ — Volume {vol_ratio}x ต่ำกว่าปกติ")
+    if price > ma50 * 1.05:
+        macro_score += 1
+        macro_notes.append(f"ราคา +{((price/ma50-1)*100):.1f}% เหนือ MA50 — cycle ระยะกลางเป็นบวก")
+    elif price < ma50 * 0.95:
+        macro_score -= 1
+        macro_notes.append(f"ราคา -{((1-price/ma50)*100):.1f}% ต่ำกว่า MA50 — cycle ระยะกลางเป็นลบ")
+    macro_signal = "positive" if macro_score > 0 else ("negative" if macro_score < 0 else "neutral")
+
+    # ── LAYER 2: COMPANY (momentum + valuation proxy) ────────────
+    company_score = 0
+    company_notes = []
+    if momentum > 5:
+        company_score += 2
+        company_notes.append(f"Momentum +{momentum:.1f}% (10d) — สะท้อนผลประกอบการ/ข่าวบวก")
+    elif momentum > 2:
+        company_score += 1
+        company_notes.append(f"Momentum +{momentum:.1f}% (10d) — ทิศทางราคาเชิงบวก")
+    elif momentum < -5:
+        company_score -= 2
+        company_notes.append(f"Momentum {momentum:.1f}% (10d) — สะท้อนแรงขาย/ข่าวลบ")
+    elif momentum < -2:
+        company_score -= 1
+        company_notes.append(f"Momentum {momentum:.1f}% (10d) — ทิศทางราคาเชิงลบ")
+    premium = (price / ma50 - 1) * 100
+    if premium > 15:
+        company_score -= 1
+        company_notes.append(f"Premium เหนือ MA50 {premium:.1f}% — ระวัง Overvalued ระยะสั้น")
+    elif premium < -15:
+        company_score += 1
+        company_notes.append(f"Discount ต่ำกว่า MA50 {abs(premium):.1f}% — อาจ Undervalued")
+    elif -5 <= premium <= 5:
+        company_notes.append(f"ราคาใกล้ Fair Value (MA50 ±5%)")
+    company_signal = "positive" if company_score > 0 else ("negative" if company_score < 0 else "neutral")
+
+    # ── LAYER 3: PRICE (technical) ───────────────────────────────
+    price_notes = []
+    if rsi < 30:
+        price_notes.append(f"RSI {rsi} — Oversold โซนซื้อทางเทคนิค")
+    elif rsi > 70:
+        price_notes.append(f"RSI {rsi} — Overbought โซนระวังแรงขาย")
+    else:
+        price_notes.append(f"RSI {rsi} — Neutral ไม่ extreme")
+    if macd_hist > 0:
+        price_notes.append("MACD Histogram บวก — Upward Momentum")
+    else:
+        price_notes.append("MACD Histogram ลบ — Downward Momentum")
+    bb_pct = round((price - bb_lower) / (bb_upper - bb_lower) * 100) if bb_upper != bb_lower else 50
+    if bb_pct <= 20:
+        price_notes.append(f"BB Position {bb_pct}% — ใกล้ Lower Band (Support)")
+    elif bb_pct >= 80:
+        price_notes.append(f"BB Position {bb_pct}% — ใกล้ Upper Band (Resistance)")
+    else:
+        price_notes.append(f"BB Position {bb_pct}% — กลาง Band")
+    price_signal = "bullish" if score > 0 else ("bearish" if score < 0 else "neutral")
+
+    # ── REASONS (2-4) ────────────────────────────────────────────
+    reasons = []
+    if rsi < 30:
+        reasons.append(f"RSI {rsi} Oversold — โอกาส Rebound ระยะสั้น")
+    elif rsi > 70:
+        reasons.append(f"RSI {rsi} Overbought — ความเสี่ยงปรับฐาน")
+    if macd_hist > 0 and momentum > 2:
+        reasons.append(f"MACD บวก + Momentum +{momentum:.1f}% — Uptrend ต่อเนื่อง")
+    elif macd_hist < 0 and momentum < -2:
+        reasons.append(f"MACD ลบ + Momentum {momentum:.1f}% — Downtrend ต่อเนื่อง")
+    if ma20 > ma50 and price > ma20:
+        reasons.append("ราคา > MA20 > MA50 — โครงสร้าง Uptrend ชัดเจน")
+    elif ma20 < ma50 and price < ma20:
+        reasons.append("ราคา < MA20 < MA50 — โครงสร้าง Downtrend")
+    if vol_ratio > 2.0:
+        reasons.append(f"Volume {vol_ratio}x — {'แรงซื้อ' if momentum > 0 else 'แรงขาย'} + Volume ยืนยัน")
+    if price <= bb_lower:
+        reasons.append("ราคาแตะ BB Lower Band — โซน Oversold เทคนิค")
+    elif price >= bb_upper:
+        reasons.append("ราคาแตะ BB Upper Band — โซน Overbought เทคนิค")
+    if not reasons:
+        reasons.append(f"Signal Score {'+' if score>=0 else ''}{score} — {'ภาพรวมบวก' if score>0 else ('ภาพรวมลบ' if score<0 else 'ทรงตัว รอสัญญาณ')}")
+    reasons = reasons[:4]
+
+    # ── RISK ALERT ───────────────────────────────────────────────
+    risks = []
+    if rsi > 75:
+        risks.append(f"RSI {rsi} สูงมาก — ระวัง Pullback")
+    if rsi < 25:
+        risks.append(f"RSI {rsi} ต่ำมาก — ระวัง Breakdown ต่อ")
+    if vol_ratio > 3.0:
+        risks.append(f"Volume {vol_ratio}x ผิดปกติ — ความผันผวนสูง")
+    if abs(momentum) > 10:
+        risks.append(f"Momentum {'+' if momentum>0 else ''}{momentum:.1f}% — อาจ Overextended")
+    if ma20 < ma50 and price < ma20:
+        risks.append("Double MA Bearish Cross — Downtrend ระยะกลาง")
+    if abs(change_pct) > 5:
+        risks.append(f"ราคาเปลี่ยนแปลง {'+' if change_pct>0 else ''}{change_pct:.1f}% วันนี้ — Gap สูง")
+    risk_alert = " · ".join(risks) if risks else None
+
+    return {
+        "macro":   {"signal": macro_signal,   "notes": macro_notes[:2]},
+        "company": {"signal": company_signal, "notes": company_notes[:2]},
+        "price":   {"signal": price_signal,   "notes": price_notes[:3]},
+        "signal":  verdict,
+        "verdict_class": vc,
+        "score":   score,
+        "reasons": reasons,
+        "risk_alert": risk_alert,
+    }
+
+# ============================================================
+# DATA FETCHERS
+# ============================================================
+
+def _build_result(ticker: str, closes: list, volumes: list,
+                  opens: list, highs: list, lows: list,
+                  price: float, open_p: float, high_p: float,
+                  low_p: float, vol_last: float, source: str,
+                  fundamentals: dict | None = None) -> dict:
+    """Shared result builder from parsed OHLCV lists."""
+    close_s = pd.Series(closes)
+    vol_s   = pd.Series(volumes)
+    prev    = closes[-2] if len(closes) >= 2 else price
+    change      = round(price - prev, 2)
+    change_pct  = round((change / prev) * 100, 2) if prev else 0.0
+    return {
+        "ticker":         ticker,
+        "backtest":       backtest_signal(closes),
+        "fundamentals":   fundamentals or dict(_EMPTY_FUNDAMENTALS),
+        "price":          round(price, 2),
+        "open":           round(open_p, 2),
+        "high":           round(high_p, 2),
+        "low":            round(low_p, 2),
+        "change":         change,
+        "change_pct":     change_pct,
+        "volume_k":       round(vol_last / 1_000, 0),
+        "value_m":        round(vol_last * price / 1_000_000, 2),
+        "rsi":            calc_rsi(close_s),
+        "macd_line":      calc_macd(close_s)[0],
+        "macd_signal":    calc_macd(close_s)[1],
+        "macd_histogram": calc_macd(close_s)[2],
+        "bb_upper":       calc_bollinger(close_s)[0],
+        "bb_mid":         calc_bollinger(close_s)[1],
+        "bb_lower":       calc_bollinger(close_s)[2],
+        "volume_ratio":   calc_volume_ratio(vol_s),
+        "momentum_10d":   calc_momentum(close_s),
+        "ma20":           calc_ma(close_s, 20),
+        "ma50":           calc_ma(close_s, 50),
+        "sparkline":      [round(float(v), 2) for v in close_s.tail(30).tolist()],
+        "source":         source,
+    }
+
+
+def fetch_yahoo(ticker: str) -> dict | None:
+    """Yahoo Finance (.BK) — primary data source."""
+    symbol = f"{ticker}.BK"
+    try:
+        tk   = yf.Ticker(symbol)
+        hist = tk.history(period="3mo", interval="1d")
+        if hist.empty or len(hist) < 30:
+            return None
+        closes  = hist["Close"].tolist()
+        volumes = hist["Volume"].tolist()
+        opens_l = hist["Open"].tolist()
+        highs_l = hist["High"].tolist()
+        lows_l  = hist["Low"].tolist()
+        fundamentals = fetch_fundamentals(tk)
+        return _build_result(
+            ticker, closes, volumes, opens_l, highs_l, lows_l,
+            price=closes[-1], open_p=opens_l[-1],
+            high_p=highs_l[-1], low_p=lows_l[-1], vol_last=volumes[-1],
+            source="Yahoo Finance (.BK)",
+            fundamentals=fundamentals,
+        )
+    except Exception as e:
+        print(f"  [Yahoo] {ticker}: {e}")
+        return None
+
+
+def fetch_stock(ticker: str) -> dict | None:
+    return fetch_yahoo(ticker)
+
+# ============================================================
+# DEMO DATA (fallback when network unavailable)
+# ============================================================
+
+DEMO_PRICES = {
+    "PTT":    {"price":31.50,"open":31.75,"high":32.00,"low":31.20,"change":-0.25,"change_pct":-0.79,"volume_k":18500,"value_m":582.75,"rsi":44.2,"macd_line":-0.12,"macd_signal":-0.08,"macd_histogram":-0.04,"bb_upper":34.10,"bb_mid":31.80,"bb_lower":29.50,"volume_ratio":0.95,"momentum_10d":-2.30,"ma20":31.80,"ma50":33.20,"sparkline":[34,33.8,33.2,33.5,32.8,32.1,31.9,32.3,31.7,31.5,31.2,31.8,32.1,31.6,31.0,31.3,31.7,31.4,31.8,31.5,31.2,31.6,31.9,31.4,31.1,31.5,31.7,31.3,31.6,31.5]},
+    "KBANK":  {"price":142.50,"open":141.00,"high":143.50,"low":140.50,"change":1.50,"change_pct":1.06,"volume_k":4200,"value_m":598.50,"rsi":58.3,"macd_line":0.85,"macd_signal":0.62,"macd_histogram":0.23,"bb_upper":148.0,"bb_mid":140.5,"bb_lower":133.0,"volume_ratio":1.35,"momentum_10d":3.20,"ma20":140.5,"ma50":137.8,"sparkline":[137,137.5,138,138.5,139,138.8,139.5,140,139.8,140.5,141,140.8,141.5,142,141.8,142.5,143,142.8,143.2,142.9,142.5,143,143.5,143.2,142.8,143.1,142.9,142.6,143.0,142.5]},
+    "AOT":    {"price":58.25,"open":58.75,"high":59.00,"low":57.80,"change":-0.50,"change_pct":-0.85,"volume_k":9800,"value_m":570.85,"rsi":38.5,"macd_line":-0.32,"macd_signal":-0.18,"macd_histogram":-0.14,"bb_upper":62.50,"bb_mid":59.20,"bb_lower":55.90,"volume_ratio":1.82,"momentum_10d":-4.10,"ma20":59.20,"ma50":61.50,"sparkline":[63,62.5,62,61.5,61,60.5,60,59.8,59.5,59.2,59,58.8,58.5,58.3,58.1,58.5,59,58.8,58.6,58.3,58.1,58.4,58.6,58.3,58.1,58.4,58.2,58.5,58.3,58.25]},
+    "ADVANC": {"price":219.00,"open":217.00,"high":220.00,"low":216.50,"change":2.00,"change_pct":0.92,"volume_k":2100,"value_m":459.90,"rsi":62.1,"macd_line":1.20,"macd_signal":0.95,"macd_histogram":0.25,"bb_upper":225.0,"bb_mid":215.0,"bb_lower":205.0,"volume_ratio":1.15,"momentum_10d":4.50,"ma20":215.0,"ma50":210.5,"sparkline":[210,210.5,211,212,213,212.5,213.5,214,215,214.5,215.5,216,217,216.5,217.5,218,217.8,218.2,218.5,218.2,217.8,218.5,219,218.8,219.2,219.5,219.2,218.8,219.3,219.0]},
+    "SCB":    {"price":101.50,"open":101.00,"high":102.50,"low":100.50,"change":0.50,"change_pct":0.49,"volume_k":5600,"value_m":568.40,"rsi":51.8,"macd_line":0.15,"macd_signal":0.10,"macd_histogram":0.05,"bb_upper":105.0,"bb_mid":101.0,"bb_lower":97.00,"volume_ratio":0.88,"momentum_10d":1.10,"ma20":101.0,"ma50":100.2,"sparkline":[100,100.2,100.5,101,100.8,101.2,101.5,101.3,101.8,102,101.8,102.2,102,101.8,102.1,101.9,102.2,101.8,102,101.5,101.2,101.8,102,101.7,101.5,101.8,102,101.7,101.5,101.5]},
+    "CPALL":  {"price":54.75,"open":55.00,"high":55.25,"low":54.25,"change":-0.25,"change_pct":-0.45,"volume_k":11200,"value_m":613.20,"rsi":47.3,"macd_line":-0.08,"macd_signal":-0.04,"macd_histogram":-0.04,"bb_upper":57.50,"bb_mid":54.80,"bb_lower":52.10,"volume_ratio":1.05,"momentum_10d":-1.20,"ma20":54.80,"ma50":55.30,"sparkline":[56,55.8,55.5,55.8,55.5,55.2,55,55.3,55.1,54.8,55,54.8,54.5,54.8,55,54.8,54.5,54.8,55,54.8,54.5,54.8,55,54.75,54.5,54.8,55,54.8,54.5,54.75]},
+    "GULF":   {"price":42.50,"open":41.25,"high":43.00,"low":41.00,"change":1.25,"change_pct":3.03,"volume_k":45000,"value_m":1912.50,"rsi":68.5,"macd_line":0.65,"macd_signal":0.42,"macd_histogram":0.23,"bb_upper":43.50,"bb_mid":40.50,"bb_lower":37.50,"volume_ratio":3.25,"momentum_10d":8.30,"ma20":40.50,"ma50":39.20,"sparkline":[38.5,38.8,39,39.2,39.5,39.8,40,40.5,40.8,41,41.2,41.5,41.8,42,41.8,42.2,42.5,42.8,42.5,42.8,43,42.8,43.2,42.9,42.6,42.8,43,42.8,42.5,42.5]},
+    "BDMS":   {"price":24.10,"open":24.00,"high":24.40,"low":23.90,"change":0.10,"change_pct":0.42,"volume_k":8900,"value_m":214.49,"rsi":53.2,"macd_line":0.05,"macd_signal":0.02,"macd_histogram":0.03,"bb_upper":25.20,"bb_mid":23.90,"bb_lower":22.60,"volume_ratio":0.92,"momentum_10d":2.10,"ma20":23.90,"ma50":23.50,"sparkline":[23.5,23.6,23.7,23.8,23.9,24,23.9,24.1,24,24.2,24.1,24.3,24.2,24.4,24.3,24.2,24.4,24.3,24.1,24.2,24.3,24.1,24.2,24.3,24.1,24.2,24.1,24.2,24.1,24.1]},
+    "TRUE":   {"price":8.35,"open":8.50,"high":8.55,"low":8.30,"change":-0.15,"change_pct":-1.76,"volume_k":52000,"value_m":434.20,"rsi":32.1,"macd_line":-0.05,"macd_signal":-0.03,"macd_histogram":-0.02,"bb_upper":9.20,"bb_mid":8.60,"bb_lower":8.00,"volume_ratio":2.10,"momentum_10d":-5.90,"ma20":8.60,"ma50":9.10,"sparkline":[9.2,9.1,9,8.9,8.8,8.7,8.6,8.5,8.7,8.6,8.5,8.4,8.6,8.5,8.4,8.5,8.6,8.5,8.4,8.3,8.5,8.4,8.3,8.5,8.4,8.3,8.5,8.4,8.35,8.35]},
+    "BBL":    {"price":155.00,"open":154.00,"high":156.00,"low":153.50,"change":1.00,"change_pct":0.65,"volume_k":3100,"value_m":480.50,"rsi":55.4,"macd_line":0.45,"macd_signal":0.30,"macd_histogram":0.15,"bb_upper":160.0,"bb_mid":153.0,"bb_lower":146.0,"volume_ratio":1.10,"momentum_10d":2.80,"ma20":153.0,"ma50":150.5,"sparkline":[150,150.5,151,152,152.5,153,152.8,153.5,154,153.8,154.5,155,154.8,155.2,155.5,155.2,155.8,155.5,155.2,155.5,155.8,155.5,155.2,155.5,155.8,155.5,155.2,155.5,155.2,155.0]},
+}
+
+_DEMO_FUNDAMENTALS = {
+    "PTT":    {"pe":10.8,"pbv":0.9,"div_yield":5.8,"market_cap":900_000_000_000,"eps":2.9},
+    "KBANK":  {"pe":7.9, "pbv":0.7,"div_yield":4.1,"market_cap":340_000_000_000,"eps":18.0},
+    "AOT":    {"pe":28.5,"pbv":4.2,"div_yield":1.2,"market_cap":830_000_000_000,"eps":2.0},
+    "ADVANC": {"pe":21.0,"pbv":7.5,"div_yield":3.6,"market_cap":650_000_000_000,"eps":10.4},
+    "SCB":    {"pe":8.4, "pbv":0.8,"div_yield":5.2,"market_cap":340_000_000_000,"eps":12.1},
+    "CPALL":  {"pe":24.0,"pbv":4.0,"div_yield":1.9,"market_cap":490_000_000_000,"eps":2.3},
+    "GULF":   {"pe":35.0,"pbv":3.8,"div_yield":1.1,"market_cap":500_000_000_000,"eps":1.2},
+    "BDMS":   {"pe":27.0,"pbv":4.5,"div_yield":1.8,"market_cap":380_000_000_000,"eps":0.9},
+    "TRUE":   {"pe":None,"pbv":1.6,"div_yield":0.0,"market_cap":290_000_000_000,"eps":-0.3},
+    "BBL":    {"pe":7.2, "pbv":0.6,"div_yield":4.4,"market_cap":295_000_000_000,"eps":21.5},
+}
+
+def make_demo_data(ticker: str) -> dict:
+    p = DEMO_PRICES.get(ticker)
+    if not p:
+        p = {"price":10.0,"open":10.0,"high":10.5,"low":9.8,"change":0.0,"change_pct":0.0,"volume_k":1000,"value_m":10.0,"rsi":50.0,"macd_line":0.0,"macd_signal":0.0,"macd_histogram":0.0,"bb_upper":11.0,"bb_mid":10.0,"bb_lower":9.0,"volume_ratio":1.0,"momentum_10d":0.0,"ma20":10.0,"ma50":10.0,"sparkline":[10]*30}
+    fund = _DEMO_FUNDAMENTALS.get(ticker, dict(_EMPTY_FUNDAMENTALS))
+    bt = backtest_signal(p["sparkline"]) if len(p.get("sparkline", [])) >= 40 else {"win_rate":None,"trades":0,"avg_return":None,"hold":5}
+    return {"ticker": ticker, "fundamentals": fund, "backtest": bt, **p}
+
+# ============================================================
+# HTML GENERATOR
+# ============================================================
+
+def build_html(stocks: list, data_source: str = "Yahoo Finance (.BK)") -> str:
+    now_bkk = datetime.now(timezone.utc) + timedelta(hours=7)
+    updated = now_bkk.strftime("%d/%m/%Y %H:%M") + " (ICT)"
+
+    total = len(stocks)
+    bullish_n = sum(1 for s in stocks if s["sig"]["score"] > 0)
+    bearish_n = sum(1 for s in stocks if s["sig"]["score"] < 0)
+    neutral_n = total - bullish_n - bearish_n
+    avg_rsi = round(sum(s["data"]["rsi"] for s in stocks) / total, 1) if total else 0
+
+    # ── Gather all sectors ──────────────────────────────────
+    sectors = sorted(set(s["info"]["sector"] for s in stocks))
+
+    # ── Build stock data JSON for JS ───────────────────────
+    stocks_json = []
+    for s in stocks:
+        d = s["data"]
+        g = s["sig"]
+        stocks_json.append({
+            "ticker": s["ticker"],
+            "name": s["info"]["name"],
+            "sector": s["info"]["sector"],
+            "price": d["price"],
+            "open": d["open"],
+            "high": d["high"],
+            "low": d["low"],
+            "change": d["change"],
+            "change_pct": d["change_pct"],
+            "volume_k": d["volume_k"],
+            "value_m": d["value_m"],
+            "rsi": d["rsi"],
+            "macd_histogram": d["macd_histogram"],
+            "bb_upper": d["bb_upper"],
+            "bb_mid": d["bb_mid"],
+            "bb_lower": d["bb_lower"],
+            "volume_ratio": d["volume_ratio"],
+            "momentum_10d": d["momentum_10d"],
+            "ma20": d["ma20"],
+            "ma50": d["ma50"],
+            "sparkline": d["sparkline"],
+            "verdict": g["verdict"],
+            "verdict_class": g["verdict_class"],
+            "score": g["score"],
+            "signals": g["signals"],
+            "summary": s["summary"],
+            "backtest": d.get("backtest", {"win_rate":None,"trades":0,"avg_return":None,"hold":5}),
+            "fundamentals": d.get("fundamentals", dict(_EMPTY_FUNDAMENTALS)),
+        })
+
+    stocks_json_str = json.dumps(stocks_json, ensure_ascii=False)
+
+    # ── Top movers ──────────────────────────────────────────
+    sorted_by_change = sorted(stocks, key=lambda s: s["data"]["change_pct"], reverse=True)
+    def mover_item(s, color):
+        pct = s["data"]["change_pct"]
+        arrow = "▲" if pct >= 0 else "▼"
+        return f'<span class="mover" style="color:{color}">{s["ticker"]} {arrow}{abs(pct):.2f}%</span>'
+    top3 = sorted_by_change[:3]
+    bot3 = sorted_by_change[-3:][::-1]
+
+    sector_tabs_html = "".join(
+        f'<button class="cat-tab" data-sector="{sec}" onclick="filterSector(this)">'
+        f'<span class="cat-dot" style="background:{SECTOR_COLORS.get(sec,"#6b7280")}"></span>{sec}</button>'
+        for sec in sectors
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SET Thailand — AI Stock Analysis</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{{
+  --bg:#08080f;--surface:#111118;--surface2:#1a1a24;--surface3:#22222f;
+  --border:#252535;--text:#e2e8f0;--muted:#6b7280;--accent:#3b82f6;
+}}
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-serif;min-height:100vh;}}
+
+/* ── HEADER ── */
+.header{{
+  background:linear-gradient(135deg,#0f0f1a 0%,#1a0a2e 50%,#0a1628 100%);
+  border-bottom:1px solid var(--border);padding:1.2rem 1.5rem;
+  display:flex;align-items:center;gap:1rem;
+}}
+.header-icon{{font-size:1.8rem;}}
+.header-title{{font-size:1.4rem;font-weight:800;color:#fff;}}
+.header-sub{{font-size:0.78rem;color:var(--muted);margin-top:0.15rem;}}
+.header-badge{{margin-left:auto;display:flex;align-items:center;gap:.5rem;}}
+.live-badge{{background:#052e16;color:#22c55e;border:1px solid #16a34a;border-radius:999px;padding:.25rem .75rem;font-size:.72rem;font-weight:700;white-space:nowrap;}}
+.refresh-btn{{background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;border-radius:999px;padding:.25rem .75rem;font-size:.72rem;font-weight:700;white-space:nowrap;cursor:pointer;transition:background .2s;}}
+.refresh-btn:hover{{background:#2563eb;color:#fff;}}
+.pulse{{animation:pulse 2s infinite;}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.4}}}}
+
+/* ── OVERVIEW BAR ── */
+.overview-bar{{display:flex;flex-wrap:wrap;gap:.75rem;padding:.85rem 1.5rem;background:var(--surface);border-bottom:1px solid var(--border);align-items:center;}}
+.ov-item{{display:flex;flex-direction:column;align-items:center;min-width:70px;}}
+.ov-label{{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;}}
+.ov-val{{font-size:1rem;font-weight:700;}}
+.ov-sep{{width:1px;height:32px;background:var(--border);}}
+.movers-bar{{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem 1.5rem;padding:.55rem 1.5rem;background:var(--surface2);border-bottom:1px solid var(--border);font-size:.8rem;}}
+.movers-label{{font-size:.68rem;text-transform:uppercase;font-weight:700;}}
+.mover{{font-weight:600;}}
+
+/* ── MAIN TOOLBAR ── */
+.toolbar{{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;padding:.75rem 1.5rem;border-bottom:1px solid var(--border);background:var(--bg);}}
+.view-tabs{{display:flex;gap:2px;background:var(--surface2);border-radius:8px;padding:2px;}}
+.view-tab{{background:none;border:none;color:var(--muted);padding:.35rem .9rem;border-radius:6px;cursor:pointer;font-size:.82rem;font-weight:600;transition:all .15s;}}
+.view-tab.active{{background:var(--accent);color:#fff;}}
+.filter-group{{display:flex;gap:.35rem;flex-wrap:wrap;}}
+.filter-btn{{background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:.25rem .7rem;border-radius:999px;cursor:pointer;font-size:.75rem;transition:all .15s;}}
+.filter-btn:hover,.filter-btn.active{{background:#1e3a5f;border-color:var(--accent);color:#93c5fd;}}
+.add-stock-btn{{margin-left:auto;background:linear-gradient(135deg,#1e3a5f,#1e4080);border:1px solid var(--accent);color:#93c5fd;padding:.3rem .9rem;border-radius:999px;cursor:pointer;font-size:.82rem;font-weight:600;transition:all .2s;white-space:nowrap;}}
+.add-stock-btn:hover{{background:#2563eb;color:#fff;}}
+
+/* ── CATEGORY TABS ── */
+.cat-bar{{display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;padding:.6rem 1.5rem;background:var(--surface);border-bottom:1px solid var(--border);}}
+.cat-tab{{background:none;border:1px solid transparent;color:var(--muted);padding:.25rem .7rem;border-radius:999px;cursor:pointer;font-size:.78rem;display:flex;align-items:center;gap:.35rem;transition:all .15s;}}
+.cat-tab:hover{{border-color:var(--border);color:var(--text);}}
+.cat-tab.active{{background:var(--surface2);border-color:var(--border);color:#fff;font-weight:600;}}
+.cat-dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0;}}
+.cat-all{{background:none;border:1px solid var(--accent);color:#93c5fd;padding:.25rem .75rem;border-radius:999px;cursor:pointer;font-size:.78rem;font-weight:600;}}
+.cat-all.active{{background:var(--accent);color:#fff;}}
+
+/* ── MAIN CONTENT SPLIT ── */
+.content-area{{display:flex;gap:0;min-height:calc(100vh - 280px);}}
+.table-pane{{flex:1;overflow:auto;}}
+.chart-pane{{
+  width:0;overflow:hidden;transition:width .3s ease;
+  background:var(--surface);border-left:1px solid var(--border);
+  flex-shrink:0;
+}}
+.chart-pane.open{{width:400px;}}
+
+/* ── REPORT TABLE ── */
+.report-table{{width:100%;border-collapse:collapse;font-size:.82rem;}}
+.report-table th{{
+  position:sticky;top:0;z-index:10;
+  background:#0d0d18;color:var(--muted);font-weight:600;
+  padding:.6rem .8rem;text-align:right;font-size:.72rem;
+  text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);
+  cursor:pointer;user-select:none;white-space:nowrap;
+}}
+.report-table th:first-child{{text-align:left;}}
+.report-table th:hover{{color:var(--text);}}
+.report-table th .sort-icon{{opacity:.3;font-size:.65rem;margin-left:2px;}}
+.report-table th.sorted .sort-icon{{opacity:1;color:var(--accent);}}
+.report-table td{{
+  padding:.55rem .8rem;text-align:right;border-bottom:1px solid #1a1a26;
+  white-space:nowrap;vertical-align:middle;
+}}
+.report-table td:first-child{{text-align:left;}}
+.report-table tr{{cursor:pointer;transition:background .12s;}}
+.report-table tr:hover{{background:#16162a;}}
+.report-table tr.selected{{background:#1e2a4a;border-left:2px solid var(--accent);}}
+
+.ticker-cell{{display:flex;flex-direction:column;gap:2px;}}
+.tc-top{{display:flex;align-items:center;gap:.4rem;}}
+.tc-sym{{font-weight:800;color:#fff;font-size:.9rem;}}
+.tc-sector{{font-size:.62rem;padding:.1rem .35rem;border-radius:3px;font-weight:600;}}
+.tc-name{{font-size:.68rem;color:var(--muted);}}
+.price-cell{{font-weight:700;color:#fff;font-size:.9rem;}}
+.chg-up{{color:#22c55e;font-weight:700;}}
+.chg-dn{{color:#ef4444;font-weight:700;}}
+.chg-neu{{color:var(--muted);}}
+.vol-cell{{color:#94a3b8;}}
+.signal-cell{{display:flex;flex-wrap:wrap;gap:2px;justify-content:flex-end;}}
+.sig-dot{{width:7px;height:7px;border-radius:50%;display:inline-block;}}
+.verdict-badge{{
+  font-size:.65rem;padding:.15rem .45rem;border-radius:4px;
+  font-weight:700;white-space:nowrap;
+}}
+.vb-strong-buy{{background:#052e16;color:#22c55e;}}
+.vb-buy{{background:#052e16;color:#4ade80;}}
+.vb-hold{{background:#1c1400;color:#fbbf24;}}
+.vb-sell{{background:#2d0000;color:#f87171;}}
+.vb-strong-sell{{background:#2d0000;color:#ef4444;}}
+
+/* ── SPARKLINE IN TABLE ── */
+.spark-svg{{display:block;}}
+
+/* ── CARD GRID VIEW ── */
+.cards-grid{{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+  gap:1rem;padding:1.25rem 1.5rem;
+}}
+.stock-card{{
+  background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:1rem;cursor:pointer;transition:transform .2s,box-shadow .2s,border-color .2s;
+}}
+.stock-card:hover{{transform:translateY(-2px);box-shadow:0 6px 24px rgba(0,0,0,.4);border-color:#3b82f640;}}
+.stock-card.selected{{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);}}
+.card-header{{display:flex;flex-direction:column;gap:.25rem;margin-bottom:.6rem;}}
+.ticker-info{{display:flex;align-items:center;gap:.4rem;}}
+.ticker-symbol{{font-size:1.1rem;font-weight:800;color:#fff;}}
+.sector-tag{{font-size:.65rem;padding:.1rem .4rem;border-radius:3px;font-weight:600;}}
+.company-name{{font-size:.78rem;color:var(--muted);}}
+.price-row{{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:.4rem;}}
+.price-value{{font-size:1.6rem;font-weight:800;color:#fff;}}
+.price-unit{{font-size:.8rem;color:var(--muted);margin-left:2px;}}
+.price-change{{font-size:.88rem;font-weight:700;}}
+.sparkline-container{{margin:.3rem 0;}}
+.indicators-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem;margin:.6rem 0;}}
+.indicator{{background:var(--surface2);border-radius:6px;padding:.4rem;}}
+.ind-label{{font-size:.6rem;color:var(--muted);text-transform:uppercase;}}
+.ind-value{{font-size:.8rem;font-weight:700;margin-top:1px;}}
+.rsi-bar{{height:2px;background:#252535;border-radius:2px;margin-top:2px;overflow:hidden;}}
+.rsi-bar div{{height:100%;border-radius:2px;}}
+.signals-row{{display:flex;flex-wrap:wrap;gap:.25rem;margin:.5rem 0;}}
+.signal-badge{{font-size:.6rem;padding:.15rem .4rem;border-radius:3px;font-weight:600;white-space:nowrap;cursor:default;}}
+.verdict-box{{border-radius:6px;padding:.45rem .8rem;text-align:center;font-weight:700;font-size:.82rem;margin:.4rem 0;}}
+.ai-summary{{font-size:.72rem;color:#94a3b8;line-height:1.55;background:var(--surface2);border-radius:6px;padding:.6rem;border-left:2px solid var(--accent);margin-top:.4rem;}}
+.layer-row{{display:flex;gap:.35rem;flex-wrap:wrap;margin-bottom:.4rem;}}
+.layer-badge{{display:inline-flex;align-items:center;gap:.25rem;border-radius:4px;padding:.15rem .45rem;font-size:.65rem;font-weight:700;border:1px solid;}}
+.layer-pos{{background:#052e16;color:#22c55e;border-color:#16a34a;}}
+.layer-neg{{background:#2d0a0a;color:#f87171;border-color:#991b1b;}}
+.layer-neu{{background:#1c1917;color:#9ca3af;border-color:#374151;}}
+.layer-bul{{background:#052e16;color:#22c55e;border-color:#16a34a;}}
+.layer-bea{{background:#2d0a0a;color:#f87171;border-color:#991b1b;}}
+.reasons-list{{list-style:none;padding:0;margin:.3rem 0 0;display:flex;flex-direction:column;gap:.2rem;}}
+.reasons-list li{{font-size:.7rem;color:#cbd5e1;padding:.15rem 0;}}
+.risk-alert{{margin-top:.35rem;padding:.25rem .5rem;background:#2d1a00;border:1px solid #92400e;border-radius:4px;font-size:.67rem;color:#fb923c;}}
+.data-disclaimer{{margin-top:.3rem;font-size:.62rem;color:#4b5563;font-style:italic;}}
+
+/* ── CHART PANEL ── */
+.chart-panel{{padding:1rem;display:flex;flex-direction:column;gap:.75rem;height:100%;overflow-y:auto;}}
+.cp-header{{display:flex;align-items:flex-start;justify-content:space-between;}}
+.cp-ticker{{font-size:1.3rem;font-weight:800;color:#fff;}}
+.cp-name{{font-size:.78rem;color:var(--muted);}}
+.cp-close{{background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem;padding:.2rem;}}
+.cp-price-row{{display:flex;align-items:baseline;gap:.6rem;}}
+.cp-price{{font-size:1.8rem;font-weight:800;color:#fff;}}
+.cp-change{{font-size:.95rem;font-weight:700;}}
+.cp-ohlc{{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;}}
+.ohlc-item{{background:var(--surface2);border-radius:6px;padding:.4rem .6rem;}}
+.ohlc-label{{font-size:.62rem;color:var(--muted);text-transform:uppercase;}}
+.ohlc-val{{font-size:.85rem;font-weight:700;}}
+.chart-container{{position:relative;height:180px;}}
+.chart-loading{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:.82rem;}}
+.cp-signals{{display:flex;flex-wrap:wrap;gap:.3rem;}}
+.cp-summary{{font-size:.73rem;color:#94a3b8;line-height:1.6;background:var(--surface2);border-radius:6px;padding:.75rem;border-left:2px solid var(--accent);}}
+.cp-indicators{{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;}}
+
+/* ── MULTI-TIMEFRAME ── */
+.mtf-section{{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:.6rem;}}
+.mtf-title{{font-size:.78rem;font-weight:700;color:#e2e8f0;margin-bottom:.5rem;display:flex;align-items:center;justify-content:space-between;gap:.5rem;}}
+.mtf-conf{{font-size:.68rem;font-weight:700;padding:.15rem .5rem;border-radius:999px;white-space:nowrap;}}
+.mtf-conf.bull{{background:#052e16;color:#22c55e;}}
+.mtf-conf.bear{{background:#2d0a0a;color:#f87171;}}
+.mtf-conf.mix{{background:#1c1917;color:#fbbf24;}}
+.mtf-table{{width:100%;border-collapse:collapse;font-size:.72rem;}}
+.mtf-table th{{color:var(--muted);font-weight:600;text-align:right;padding:.3rem .4rem;border-bottom:1px solid var(--border);font-size:.66rem;text-transform:uppercase;}}
+.mtf-table th:first-child{{text-align:left;}}
+.mtf-table td{{padding:.35rem .4rem;text-align:right;border-bottom:1px solid #1a1a26;}}
+.mtf-table td:first-child{{text-align:left;font-weight:700;color:#fff;}}
+.mtf-trend{{font-weight:700;padding:.1rem .4rem;border-radius:4px;font-size:.68rem;}}
+.mtf-trend.up{{background:#052e16;color:#22c55e;}}
+.mtf-trend.down{{background:#2d0a0a;color:#f87171;}}
+.mtf-trend.flat{{background:#1c1917;color:#9ca3af;}}
+
+/* ── FUNDAMENTALS + BACKTEST ── */
+.fund-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem;margin:.5rem 0;}}
+.fund-item{{background:var(--surface2);border-radius:6px;padding:.4rem;text-align:center;}}
+.fund-label{{font-size:.58rem;color:var(--muted);text-transform:uppercase;}}
+.fund-value{{font-size:.82rem;font-weight:700;margin-top:1px;}}
+.bt-box{{display:flex;align-items:center;gap:.5rem;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:.5rem .6rem;margin:.4rem 0;}}
+.bt-rate{{font-size:1.2rem;font-weight:800;}}
+.bt-meta{{font-size:.66rem;color:var(--muted);line-height:1.4;}}
+.bt-good{{color:#22c55e;}}
+.bt-mid{{color:#fbbf24;}}
+.bt-bad{{color:#f87171;}}
+
+/* ── ADD STOCK MODAL ── */
+.modal-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(4px);z-index:1000;align-items:center;justify-content:center;}}
+.modal-box{{background:#13131f;border:1px solid var(--border);border-radius:14px;width:min(460px,95vw);max-height:90vh;overflow-y:auto;box-shadow:0 24px 64px rgba(0,0,0,.6);}}
+.modal-header{{display:flex;align-items:center;justify-content:space-between;padding:1.1rem 1.4rem;border-bottom:1px solid var(--border);font-size:.95rem;font-weight:700;color:#fff;}}
+.modal-close{{background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem;padding:.2rem .4rem;border-radius:5px;}}
+.modal-close:hover{{color:#fff;}}
+.modal-body{{padding:1.25rem;display:flex;flex-direction:column;gap:.85rem;}}
+.input-row{{display:flex;gap:.4rem;}}
+.ticker-input{{flex:1;background:var(--surface2);border:1px solid var(--border);color:#fff;border-radius:7px;padding:.55rem .8rem;font-size:.9rem;outline:none;transition:border-color .15s;text-transform:uppercase;}}
+.ticker-input:focus{{border-color:var(--accent);}}
+.add-btn{{background:#2563eb;color:#fff;border:none;border-radius:7px;padding:.55rem 1rem;font-size:.85rem;font-weight:600;cursor:pointer;}}
+.add-btn:hover{{background:#1d4ed8;}}
+.add-status{{font-size:.8rem;min-height:1.1em;}}
+.suggestions{{display:flex;flex-wrap:wrap;gap:.3rem;}}
+.sug-item{{background:#1e3a5f;color:#93c5fd;border:1px solid #3b82f640;border-radius:999px;padding:.18rem .55rem;font-size:.73rem;cursor:pointer;}}
+.sug-item:hover{{background:#2563eb;color:#fff;}}
+.custom-list-label{{font-size:.76rem;color:var(--muted);font-weight:600;}}
+.custom-list{{display:flex;flex-direction:column;gap:.3rem;}}
+.clist-item{{display:flex;align-items:center;justify-content:space-between;background:var(--surface2);border-radius:7px;padding:.4rem .65rem;font-size:.82rem;}}
+.clist-remove{{background:none;border:none;color:#ef4444;cursor:pointer;font-size:.73rem;padding:.1rem .3rem;}}
+.suggest-popular{{display:flex;flex-direction:column;gap:.4rem;}}
+.suggest-title{{font-size:.7rem;color:var(--muted);font-weight:600;text-transform:uppercase;}}
+.suggest-chips{{display:flex;flex-wrap:wrap;gap:.3rem;}}
+.suggest-chip{{background:var(--surface2);color:#94a3b8;border:1px solid var(--border);border-radius:999px;padding:.2rem .55rem;font-size:.73rem;cursor:pointer;}}
+.suggest-chip:hover{{background:#1e3a5f;color:#93c5fd;border-color:var(--accent);}}
+.hidden{{display:none!important;}}
+
+/* ── FOOTER ── */
+.footer{{text-align:center;padding:1.5rem;color:var(--muted);font-size:.7rem;border-top:1px solid var(--border);}}
+
+@media(max-width:768px){{
+  /* Header */
+  .header{{padding:.75rem 1rem;gap:.6rem;}}
+  .header-icon{{font-size:1.4rem;}}
+  .header-title{{font-size:1.05rem;}}
+  .header-sub{{font-size:.68rem;}}
+  .live-badge{{font-size:.65rem;padding:.2rem .55rem;}}
+  .refresh-btn{{font-size:.65rem;padding:.2rem .55rem;}}
+
+  /* Bars */
+  .overview-bar{{padding:.6rem .75rem;gap:.5rem;}}
+  .ov-item{{min-width:56px;}}
+  .ov-label{{font-size:.6rem;}}
+  .ov-val{{font-size:.85rem;}}
+  .movers-bar{{font-size:.72rem;padding:.5rem .75rem;flex-wrap:wrap;gap:.3rem;}}
+  .cat-bar{{padding:.5rem .75rem;gap:.3rem;flex-wrap:wrap;}}
+  .cat-tab,.cat-all{{font-size:.7rem;padding:.2rem .5rem;}}
+
+  /* Toolbar */
+  .toolbar{{padding:.6rem .75rem;flex-direction:column;align-items:flex-start;gap:.4rem;}}
+  .view-tabs,.filter-group{{flex-wrap:wrap;gap:.25rem;}}
+  .filter-btn{{font-size:.68rem;padding:.2rem .45rem;}}
+  .add-stock-btn{{font-size:.75rem;padding:.3rem .75rem;width:100%;text-align:center;}}
+
+  /* Table — horizontal scroll */
+  .table-pane{{overflow-x:auto;-webkit-overflow-scrolling:touch;}}
+  .report-table{{min-width:640px;font-size:.72rem;}}
+  .report-table th,
+  .report-table td{{padding:.4rem .5rem;}}
+
+  /* Cards */
+  .cards-grid{{grid-template-columns:1fr;padding:.75rem;gap:.75rem;}}
+
+  /* Chart panel full-screen on mobile */
+  .chart-pane.open{{width:100%;position:fixed;inset:0;z-index:200;overflow-y:auto;border-radius:0;}}
+
+  /* Modal */
+  .modal-box{{width:95vw;max-height:90vh;}}
+}}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <span class="header-icon">📈</span>
+  <div>
+    <div class="header-title">SET Thailand — AI Stock Analysis</div>
+    <div class="header-sub">ระบบวิเคราะห์หุ้นไทย · Data + Signal + AI Summary</div>
+  </div>
+  <div class="header-badge">
+    <span class="live-badge" id="liveBadge"><span class="pulse" id="liveDot">●</span> <span id="liveLabel">Live Data</span></span>
+    <span id="lastUpdated" style="font-size:.68rem;color:#6b7280;"></span>
+    <button class="refresh-btn" onclick="refreshLive()" id="refreshBtn">🔄 Refresh Live</button>
+  </div>
+</header>
+
+<!-- OVERVIEW BAR -->
+<div class="overview-bar">
+  <div class="ov-item"><span class="ov-label">หุ้นทั้งหมด</span><span class="ov-val" id="ov-total">{total}</span></div>
+  <div class="ov-sep"></div>
+  <div class="ov-item"><span class="ov-label">สัญญาณบวก</span><span class="ov-val" id="ov-bullish" style="color:#22c55e">{bullish_n}</span></div>
+  <div class="ov-item"><span class="ov-label">สัญญาณลบ</span><span class="ov-val" id="ov-bearish" style="color:#ef4444">{bearish_n}</span></div>
+  <div class="ov-item"><span class="ov-label">ทรงตัว</span><span class="ov-val" id="ov-neutral" style="color:#fbbf24">{neutral_n}</span></div>
+  <div class="ov-sep"></div>
+  <div class="ov-item"><span class="ov-label">RSI เฉลี่ย</span><span class="ov-val" id="ov-rsi" style="color:#3b82f6">{avg_rsi}</span></div>
+  <div class="ov-sep"></div>
+  <div class="ov-item"><span class="ov-label">อัปเดต</span><span class="ov-val" style="font-size:.75rem">{updated}</span></div>
+</div>
+
+<!-- MOVERS BAR -->
+<div class="movers-bar" id="moversBar">
+  <span class="movers-label" style="color:#22c55e">▲ TOP ขึ้น:</span>
+  {'&nbsp;'.join(mover_item(s,'#22c55e') for s in top3)}
+  &nbsp;&nbsp;
+  <span class="movers-label" style="color:#ef4444">▼ TOP ลง:</span>
+  {'&nbsp;'.join(mover_item(s,'#ef4444') for s in bot3)}
+</div>
+
+<!-- TOOLBAR -->
+<div class="toolbar">
+  <div class="view-tabs">
+    <button class="view-tab active" id="tabReport" onclick="switchView('report',this)">ตารางรายงาน</button>
+    <button class="view-tab" id="tabCards"  onclick="switchView('cards',this)">การ์ดวิเคราะห์</button>
+  </div>
+  <div class="filter-group" id="verdictFilters">
+    <button class="filter-btn active" onclick="filterVerdict('all',this)">ทั้งหมด</button>
+    <button class="filter-btn" onclick="filterVerdict('strong-buy',this)">Strong Buy</button>
+    <button class="filter-btn" onclick="filterVerdict('buy',this)">Buy</button>
+    <button class="filter-btn" onclick="filterVerdict('hold',this)">Hold</button>
+    <button class="filter-btn" onclick="filterVerdict('sell',this)">Sell</button>
+    <button class="filter-btn" onclick="filterVerdict('strong-sell',this)">Strong Sell</button>
+  </div>
+  <div style="display:flex;gap:.4rem;margin-left:auto;flex-wrap:wrap;">
+    <button id="restoreBtn" onclick="restoreAllStocks()" style="display:none;background:#1c1917;color:#f97316;border:1px solid #92400e;border-radius:6px;padding:.3rem .75rem;font-size:.75rem;cursor:pointer;align-items:center;gap:.3rem;">↩ คืนหุ้นที่ซ่อน</button>
+    <button class="add-stock-btn" onclick="openModal()">+ เพิ่มหุ้น</button>
+  </div>
+</div>
+
+<!-- CATEGORY TABS -->
+<div class="cat-bar" id="catBar">
+  <button class="cat-all active" id="catAll" onclick="filterSectorAll(this)">ทั้งหมด</button>
+  {sector_tabs_html}
+</div>
+
+<!-- CONTENT SPLIT: TABLE PANE + CHART PANE -->
+<div class="content-area" id="contentArea">
+
+  <!-- TABLE PANE -->
+  <div class="table-pane" id="reportView">
+    <table class="report-table" id="reportTable">
+      <thead>
+        <tr>
+          <th onclick="sortTable('ticker')" data-col="ticker">หุ้น <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('price')" data-col="price">ล่าสุด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('change_pct')" data-col="change_pct">เปลี่ยนแปลง <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('open')" data-col="open">เปิด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('high')" data-col="high">สูงสุด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('low')" data-col="low">ต่ำสุด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('volume_k')" data-col="volume_k">ปริมาณ<br><small>('000)</small> <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('value_m')" data-col="value_m">มูลค่า<br><small>(ลบ.)</small> <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('rsi')" data-col="rsi">RSI <span class="sort-icon">↕</span></th>
+          <th>30วัน</th>
+          <th onclick="sortTable('score')" data-col="score">สัญญาณ <span class="sort-icon">↕</span></th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+
+  <!-- CARD PANE -->
+  <div class="table-pane hidden" id="cardsView">
+    <div class="cards-grid" id="cardsGrid"></div>
+  </div>
+
+  <!-- CHART PANE (slide-in) -->
+  <div class="chart-pane" id="chartPane">
+    <div class="chart-panel" id="chartPanel"></div>
+  </div>
+</div>
+
+<footer class="footer">
+  อัปเดตล่าสุด: {updated} · ข้อมูลจาก <strong>{data_source}</strong> · GitHub Actions อัปเดตทุก 15 นาที (ช่วงตลาด SET เปิด)<br>
+  <strong>คำเตือน:</strong> ข้อมูลนี้เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน
+</footer>
+
+<!-- ADD STOCK MODAL -->
+<div id="stockModal" class="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <div class="modal-header">เพิ่มหุ้นที่สนใจ<button onclick="closeModal()" class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="input-row">
+        <input id="tickerInput" type="text" placeholder="พิมพ์ ticker เช่น MINT, SCC, DELTA..." class="ticker-input" oninput="onTickerInput(this.value)" onkeydown="if(event.key==='Enter')addCustomStock()"/>
+        <button onclick="addCustomStock()" class="add-btn">เพิ่ม</button>
+      </div>
+      <div id="suggestions" class="suggestions"></div>
+      <div id="addStatus" class="add-status"></div>
+      <div class="custom-list-label">หุ้นที่เพิ่มไว้ <span id="customCount"></span></div>
+      <div id="customList" class="custom-list"></div>
+      <div class="suggest-popular">
+        <div class="suggest-title">หุ้นยอดนิยม SET</div>
+        <div class="suggest-chips">
+          <span class="suggest-chip" onclick="quickAdd('MINT')">MINT</span>
+          <span class="suggest-chip" onclick="quickAdd('SCC')">SCC</span>
+          <span class="suggest-chip" onclick="quickAdd('DELTA')">DELTA</span>
+          <span class="suggest-chip" onclick="quickAdd('PTTGC')">PTTGC</span>
+          <span class="suggest-chip" onclick="quickAdd('IVL')">IVL</span>
+          <span class="suggest-chip" onclick="quickAdd('BH')">BH</span>
+          <span class="suggest-chip" onclick="quickAdd('CENTEL')">CENTEL</span>
+          <span class="suggest-chip" onclick="quickAdd('KTC')">KTC</span>
+          <span class="suggest-chip" onclick="quickAdd('HMPRO')">HMPRO</span>
+          <span class="suggest-chip" onclick="quickAdd('TU')">TU</span>
+          <span class="suggest-chip" onclick="quickAdd('BEM')">BEM</span>
+          <span class="suggest-chip" onclick="quickAdd('CPN')">CPN</span>
+          <span class="suggest-chip" onclick="quickAdd('GPSC')">GPSC</span>
+          <span class="suggest-chip" onclick="quickAdd('EA')">EA</span>
+          <span class="suggest-chip" onclick="quickAdd('OSP')">OSP</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── DATA ──────────────────────────────────────────────────────
+const STOCKS_INITIAL = {stocks_json_str};
+const SECTOR_COLORS  = {json.dumps(SECTOR_COLORS, ensure_ascii=False)};
+
+// ── 3-LAYER SUMMARY RENDERER ─────────────────────────────────
+function layerClass(sig) {{
+  return {{positive:'layer-pos',negative:'layer-neg',neutral:'layer-neu',bullish:'layer-bul',bearish:'layer-bea'}}[sig]||'layer-neu';
+}}
+function layerLabel(sig) {{
+  return {{positive:'▲ บวก',negative:'▼ ลบ',neutral:'— ทรงตัว',bullish:'▲ Bullish',bearish:'▼ Bearish'}}[sig]||'—';
+}}
+function renderSummaryHTML(sm) {{
+  if (!sm || typeof sm !== 'object') return `<div class="ai-summary">${{sm||''}}</div>`;
+  const layers = [
+    ['🌍 Macro', sm.macro?.signal],
+    ['🏢 Company', sm.company?.signal],
+    ['📊 Price', sm.price?.signal],
+  ];
+  const layerBadges = layers.map(([lbl,sig]) =>
+    `<span class="layer-badge ${{layerClass(sig)}}">${{lbl}} ${{layerLabel(sig)}}</span>`
+  ).join('');
+  const reasons = (sm.reasons||[]).map(r => `<li>· ${{r}}</li>`).join('');
+  const risk = sm.risk_alert
+    ? `<div class="risk-alert">⚠️ Risk: ${{sm.risk_alert}}</div>` : '';
+  const disc = `<div class="data-disclaimer">ข้อมูลอาจล่าช้า/ประมาณการ อัปเดตทุก 15 นาที เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน</div>`;
+  return `<div class="ai-summary">
+    <div class="layer-row">${{layerBadges}}</div>
+    <ul class="reasons-list">${{reasons}}</ul>
+    ${{risk}}${{disc}}
+  </div>`;
+}}
+function renderCpSummaryHTML(sm, vcol) {{
+  if (!sm || typeof sm !== 'object') return `<div class="cp-summary" style="border-left-color:${{vcol}}">${{sm||''}}</div>`;
+  const layers = [
+    ['🌍 Macro', sm.macro?.signal],
+    ['🏢 Company', sm.company?.signal],
+    ['📊 Price', sm.price?.signal],
+  ];
+  const layerBadges = layers.map(([lbl,sig]) =>
+    `<span class="layer-badge ${{layerClass(sig)}}">${{lbl}} ${{layerLabel(sig)}}</span>`
+  ).join('');
+  const reasons = (sm.reasons||[]).map(r => `<li>· ${{r}}</li>`).join('');
+  const risk = sm.risk_alert
+    ? `<div class="risk-alert">⚠️ Risk: ${{sm.risk_alert}}</div>` : '';
+  const disc = `<div class="data-disclaimer">ข้อมูลใกล้เคียงเรียลไทม์ / อาจล่าช้า / ต้นแบบ อัปเดตทุก 15 นาที · ราคาอาจล่าช้า ไม่สมบูรณ์ หรือเปลี่ยนแปลงได้ · เพื่อการศึกษาและทดสอบตรรกะเท่านั้น ไม่ใช่คำแนะนำการลงทุน</div>`;
+  return `<div class="cp-summary" style="border-left-color:${{vcol}}">
+    <div class="layer-row">${{layerBadges}}</div>
+    <ul class="reasons-list">${{reasons}}</ul>
+    ${{risk}}${{disc}}
+  </div>`;
+}}
+
+// ── FUNDAMENTALS + BACKTEST RENDERER ─────────────────────────
+function fmtMcap(v) {{
+  if (!v) return '—';
+  if (v >= 1e12) return (v/1e12).toFixed(2)+' ลลบ.';
+  if (v >= 1e9)  return (v/1e9).toFixed(1)+' พลบ.';
+  if (v >= 1e6)  return (v/1e6).toFixed(0)+' ลบ.';
+  return v.toLocaleString();
+}}
+function renderFundBT(s) {{
+  const f = s.fundamentals || {{}};
+  const b = s.backtest || {{}};
+  const v = x => (x===null||x===undefined) ? '—' : x;
+  const fund = `<div class="fund-grid">
+    <div class="fund-item"><div class="fund-label">P/E</div><div class="fund-value">${{v(f.pe)}}</div></div>
+    <div class="fund-item"><div class="fund-label">P/BV</div><div class="fund-value">${{v(f.pbv)}}</div></div>
+    <div class="fund-item"><div class="fund-label">ปันผล</div><div class="fund-value" style="color:${{f.div_yield>=4?'#22c55e':'#e2e8f0'}}">${{f.div_yield!=null?f.div_yield+'%':'—'}}</div></div>
+    <div class="fund-item"><div class="fund-label">EPS</div><div class="fund-value" style="color:${{f.eps>0?'#22c55e':f.eps<0?'#f87171':'#e2e8f0'}}">${{v(f.eps)}}</div></div>
+    <div class="fund-item" style="grid-column:span 2"><div class="fund-label">Market Cap</div><div class="fund-value">${{fmtMcap(f.market_cap)}}</div></div>
+  </div>`;
+  let bt = '';
+  if (b.win_rate != null) {{
+    const cls = b.win_rate>=55?'bt-good':b.win_rate>=45?'bt-mid':'bt-bad';
+    const arCol = b.avg_return>0?'#22c55e':'#f87171';
+    bt = `<div class="bt-box">
+      <div class="bt-rate ${{cls}}">${{b.win_rate}}%</div>
+      <div class="bt-meta">
+        <div>📈 Backtest Win Rate (สัญญาณ EMA+RSI, ถือ ${{b.hold}} วัน)</div>
+        <div>${{b.trades}} เทรด · ผลตอบแทนเฉลี่ย <span style="color:${{arCol}}">${{b.avg_return>=0?'+':''}}${{b.avg_return}}%</span>/เทรด</div>
+      </div>
+    </div>`;
+  }} else {{
+    bt = `<div class="bt-box"><div class="bt-meta">📈 Backtest: ข้อมูลไม่พอ (ต้องการ ≥40 วัน)</div></div>`;
+  }}
+  return fund + bt;
+}}
+
+// allStocks = single source of truth (server + custom mixed)
+let allStocks = [...STOCKS_INITIAL];
+
+// ── HIDDEN TICKERS (localStorage) ────────────────────────────
+function getHiddenList() {{ try {{ return JSON.parse(localStorage.getItem('hiddenTickers')||'[]'); }} catch{{return[];}} }}
+function saveHiddenList(list) {{ localStorage.setItem('hiddenTickers', JSON.stringify(list)); }}
+
+// ── STATE ─────────────────────────────────────────────────────
+let currentView   = 'report';
+let verdictFilter = 'all';
+let sectorFilter  = 'all';
+let sortCol       = 'score';
+let sortDir       = -1;
+let selectedTicker = null;
+let chartInstance  = null;
+
+// ── HELPERS ───────────────────────────────────────────────────
+const chgColor = pct => pct > 0 ? '#22c55e' : pct < 0 ? '#ef4444' : '#9ca3af';
+const arrow    = pct => pct > 0 ? '▲' : pct < 0 ? '▼' : '−';
+const fmtChg   = (c,pct) => `${{arrow(pct)}} ${{Math.abs(pct).toFixed(2)}}% (${{c>=0?'+':''}}${{c.toFixed(2)}})`;
+
+const vbClass = vc => `verdict-badge vb-${{vc}}`;
+const vbLabel = {{
+  'strong-buy':'Strong Buy','buy':'Buy','hold':'Hold',
+  'sell':'Sell','strong-sell':'Strong Sell'
+}};
+
+// ── RENDER ALL (single call updates every UI section) ──────────
+function renderAll() {{
+  refreshOverview();
+  refreshMovers();
+  refreshCategoryTabs();
+  if (currentView === 'report') renderTable();
+  else renderCards();
+}}
+
+// ── OVERVIEW BAR ──────────────────────────────────────────────
+function refreshOverview() {{
+  const total   = allStocks.length;
+  const bullish = allStocks.filter(s => s.score > 0).length;
+  const bearish = allStocks.filter(s => s.score < 0).length;
+  const neutral = total - bullish - bearish;
+  const avgRsi  = total ? (allStocks.reduce((a,s)=>a+s.rsi,0)/total).toFixed(1) : 0;
+  const set = (id,v) => {{ const el=document.getElementById(id); if(el) el.textContent=v; }};
+  set('ov-total',   total);
+  set('ov-bullish', bullish);
+  set('ov-bearish', bearish);
+  set('ov-neutral', neutral);
+  set('ov-rsi',     avgRsi);
+}}
+
+// ── MOVERS BAR ────────────────────────────────────────────────
+function refreshMovers() {{
+  const bar = document.getElementById('moversBar');
+  if (!bar) return;
+  const sorted = [...allStocks].sort((a,b)=>b.change_pct-a.change_pct);
+  const top3 = sorted.slice(0,3);
+  const bot3 = sorted.slice(-3).reverse();
+  const item = (s,col) => `<span class="mover" style="color:${{col}}">${{s.ticker}} ${{s.change_pct>=0?'▲':'▼'}}${{Math.abs(s.change_pct).toFixed(2)}}%</span>`;
+  bar.innerHTML =
+    `<span class="movers-label" style="color:#22c55e">▲ TOP ขึ้น:</span>
+     ${{top3.map(s=>item(s,'#22c55e')).join('&nbsp;')}}
+     &nbsp;&nbsp;
+     <span class="movers-label" style="color:#ef4444">▼ TOP ลง:</span>
+     ${{bot3.map(s=>item(s,'#ef4444')).join('&nbsp;')}}`;
+}}
+
+// ── CATEGORY TABS ─────────────────────────────────────────────
+function refreshCategoryTabs() {{
+  const bar = document.getElementById('catBar');
+  if (!bar) return;
+  bar.querySelectorAll('.cat-tab').forEach(t => t.remove());
+  const sectors = [...new Set(allStocks.map(s=>s.sector))].sort();
+  sectors.forEach(sec => {{
+    const col = SECTOR_COLORS[sec] || '#6b7280';
+    const btn = document.createElement('button');
+    btn.className = 'cat-tab' + (sectorFilter===sec?' active':'');
+    btn.dataset.sector = sec;
+    btn.onclick = function(){{ filterSector(this); }};
+    btn.innerHTML = `<span class="cat-dot" style="background:${{col}}"></span>${{sec}}`;
+    bar.appendChild(btn);
+  }});
+}}
+
+function visible(s) {{
+  const vm = verdictFilter === 'all' || s.verdict_class === verdictFilter;
+  const sm = sectorFilter  === 'all' || s.sector === sectorFilter;
+  const hm = !getHiddenList().includes(s.ticker);
+  return vm && sm && hm;
+}}
+
+function filteredStocks() {{
+  let data = allStocks.filter(visible);
+  if (sortCol) {{
+    data = [...data].sort((a,b) => {{
+      const av = a[sortCol] ?? (typeof a[sortCol]==='string' ? '' : 0);
+      const bv = b[sortCol] ?? (typeof b[sortCol]==='string' ? '' : 0);
+      if (typeof av === 'string') return sortDir * av.localeCompare(bv);
+      return sortDir * (av - bv);
+    }});
+  }}
+  return data;
+}}
+
+// ── SPARKLINE ─────────────────────────────────────────────────
+function sparkSVG(data, w=80, h=28) {{
+  if (!data?.length) return '';
+  const mn = Math.min(...data), mx = Math.max(...data), rng = mx-mn||1;
+  const pts = data.map((v,i) =>
+    `${{(i*w/(data.length-1)).toFixed(1)}},${{(h-((v-mn)/rng)*h).toFixed(1)}}`
+  ).join(' ');
+  const col = data[data.length-1] >= data[0] ? '#22c55e' : '#ef4444';
+  return `<svg class="spark-svg" width="${{w}}" height="${{h}}" viewBox="0 0 ${{w}} ${{h}}">
+    <polyline points="${{pts}}" fill="none" stroke="${{col}}" stroke-width="1.5" stroke-linejoin="round"/>
+  </svg>`;
+}}
+
+// ── TABLE RENDER ──────────────────────────────────────────────
+function renderTable() {{
+  const tbody = document.getElementById('tableBody');
+  const rows = filteredStocks();
+  const secCol = SECTOR_COLORS;
+  tbody.innerHTML = rows.map(s => {{
+    const cc = chgColor(s.change_pct);
+    const rsiCol = s.rsi < 30 ? '#22c55e' : s.rsi > 70 ? '#ef4444' : '#3b82f6';
+    const sigDots = s.signals.slice(0,6).map(sig => {{
+      const c = {{bullish:'#22c55e',bearish:'#ef4444',alert:'#fbbf24',neutral:'#6b7280'}}[sig.type]||'#6b7280';
+      return `<span class="sig-dot" style="background:${{c}}" title="${{sig.label}}: ${{sig.detail}}"></span>`;
+    }}).join('');
+    const sc = secCol[s.sector] || '#6b7280';
+    const sel = selectedTicker === s.ticker ? 'selected' : '';
+    const delBtn = `<button onclick="event.stopPropagation();hideStock('${{s.ticker}}')" style="margin-left:.35rem;background:none;border:none;color:#4b5563;cursor:pointer;font-size:.75rem;padding:0;line-height:1" title="ซ่อนหุ้นนี้">🗑</button>`;
+    return `<tr class="${{sel}}" onclick="selectStock('${{s.ticker}}')" data-ticker="${{s.ticker}}" data-sector="${{s.sector}}" data-verdict="${{s.verdict_class}}">
+      <td>
+        <div class="ticker-cell">
+          <div class="tc-top">
+            <span class="tc-sym">${{s.ticker}}</span>
+            <span class="tc-sector" style="background:${{sc}}20;color:${{sc}}">${{s.sector}}</span>
+            ${{delBtn}}
+          </div>
+          <span class="tc-name">${{s.name}}</span>
+        </div>
+      </td>
+      <td class="price-cell">${{s.price.toFixed(2)}}</td>
+      <td style="color:${{cc}};font-weight:700">${{fmtChg(s.change,s.change_pct)}}</td>
+      <td class="vol-cell">${{s.open.toFixed(2)}}</td>
+      <td style="color:#22c55e">${{s.high.toFixed(2)}}</td>
+      <td style="color:#ef4444">${{s.low.toFixed(2)}}</td>
+      <td class="vol-cell">${{Number(s.volume_k).toLocaleString()}}</td>
+      <td class="vol-cell">${{s.value_m.toLocaleString('th',{{minimumFractionDigits:2}})}}</td>
+      <td style="color:${{rsiCol}};font-weight:700">${{s.rsi}}</td>
+      <td>${{sparkSVG(s.sparkline)}}</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:.4rem;justify-content:flex-end">
+          <div class="signal-cell">${{sigDots}}</div>
+          <span class="${{vbClass(s.verdict_class)}}">${{vbLabel[s.verdict_class]||s.verdict}}</span>
+        </div>
+      </td>
+    </tr>`;
+  }}).join('');
+}}
+
+// ── CARD RENDER ───────────────────────────────────────────────
+function renderCards() {{
+  const grid = document.getElementById('cardsGrid');
+  const rows = filteredStocks();
+  const vcStyles = {{
+    'strong-buy': ['#052e16','#16a34a','#22c55e'],
+    'buy':        ['#052e16','#15803d','#4ade80'],
+    'hold':       ['#1c1917','#92400e','#fbbf24'],
+    'sell':       ['#2d0000','#b91c1c','#f87171'],
+    'strong-sell':['#2d0000','#991b1b','#ef4444'],
+  }};
+  const bstyle = {{
+    bullish:'background:#052e16;color:#4ade80;border:1px solid #16a34a',
+    bearish:'background:#2d0000;color:#f87171;border:1px solid #b91c1c',
+    neutral:'background:#1c1917;color:#d1d5db;border:1px solid #374151',
+    alert:  'background:#1c1400;color:#fbbf24;border:1px solid #92400e',
+  }};
+  grid.innerHTML = rows.map(s => {{
+    const sc = SECTOR_COLORS[s.sector] || '#6b7280';
+    const cc = chgColor(s.change_pct);
+    const [vbg,vborder,vtext] = vcStyles[s.verdict_class] || ['#1c1917','#6b7280','#d1d5db'];
+    const badges = s.signals.slice(0,6).map(sig =>
+      `<span class="signal-badge" style="${{bstyle[sig.type]||bstyle.neutral}}" title="${{sig.detail}}">${{sig.label}}</span>`
+    ).join('');
+    const rsiCol = s.rsi<30?'#22c55e':s.rsi>70?'#ef4444':'#3b82f6';
+    const sel = selectedTicker === s.ticker ? 'selected' : '';
+    const cardDelBtn = `<button onclick="event.stopPropagation();hideStock('${{s.ticker}}')" style="margin-left:auto;background:none;border:none;color:#4b5563;cursor:pointer;font-size:.75rem;padding:0" title="ซ่อนหุ้นนี้">🗑 ลบ</button>`;
+    return `<div class="stock-card ${{sel}}" onclick="selectStock('${{s.ticker}}')" data-ticker="${{s.ticker}}" data-sector="${{s.sector}}" data-verdict="${{s.verdict_class}}">
+      <div class="card-header">
+        <div class="ticker-info">
+          <span class="ticker-symbol">${{s.ticker}}</span>
+          <span class="sector-tag" style="background:${{sc}}20;color:${{sc}}">${{s.sector}}</span>
+          ${{cardDelBtn}}
+        </div>
+        <span class="company-name">${{s.name}}</span>
+      </div>
+      <div class="price-row">
+        <div><span class="price-value">${{s.price.toFixed(2)}}</span><span class="price-unit">฿</span></div>
+        <div class="price-change" style="color:${{cc}}">${{fmtChg(s.change,s.change_pct)}}</div>
+      </div>
+      <div class="sparkline-container">${{sparkSVG(s.sparkline,120,38)}}</div>
+      <div class="indicators-grid">
+        <div class="indicator"><span class="ind-label">RSI(14)</span><span class="ind-value" style="color:${{rsiCol}}">${{s.rsi}}</span><div class="rsi-bar"><div style="width:${{Math.min(s.rsi,100)}}%;background:${{rsiCol}}"></div></div></div>
+        <div class="indicator"><span class="ind-label">MACD</span><span class="ind-value" style="color:${{s.macd_histogram>0?'#22c55e':'#ef4444'}}">${{s.macd_histogram>=0?'+':''}}${{s.macd_histogram.toFixed(4)}}</span></div>
+        <div class="indicator"><span class="ind-label">Vol</span><span class="ind-value" style="color:${{s.volume_ratio>1.5?'#fbbf24':'#9ca3af'}}">${{s.volume_ratio}}x</span></div>
+        <div class="indicator"><span class="ind-label">MA20</span><span class="ind-value">${{s.ma20.toFixed(2)}}</span></div>
+        <div class="indicator"><span class="ind-label">MA50</span><span class="ind-value">${{s.ma50.toFixed(2)}}</span></div>
+        <div class="indicator"><span class="ind-label">Mom10d</span><span class="ind-value" style="color:${{s.momentum_10d>=0?'#22c55e':'#ef4444'}}">${{s.momentum_10d>=0?'+':''}}${{s.momentum_10d.toFixed(2)}}%</span></div>
+      </div>
+      <div class="signals-row">${{badges}}</div>
+      <div class="verdict-box" style="background:${{vbg}};border:1px solid ${{vborder}};color:${{vtext}}">${{s.verdict}} (score ${{s.score>=0?'+':''}}${{s.score}})</div>
+      ${{renderFundBT(s)}}
+      ${{renderSummaryHTML(s.summary)}}
+    </div>`;
+  }}).join('');
+}}
+
+// ── SELECT STOCK → CHART PANEL ────────────────────────────────
+function selectStock(ticker) {{
+  selectedTicker = ticker;
+  const s = allStocks.find(x => x.ticker === ticker);
+  if (!s) return;
+  openChartPane(s);
+  if (currentView === 'report') renderTable(); else renderCards();
+}}
+
+function openChartPane(s) {{
+  const pane = document.getElementById('chartPane');
+  const panel = document.getElementById('chartPanel');
+  pane.classList.add('open');
+
+  const cc = chgColor(s.change_pct);
+  const vcStyles = {{
+    'strong-buy':'#22c55e','buy':'#4ade80','hold':'#fbbf24',
+    'sell':'#f87171','strong-sell':'#ef4444'
+  }};
+  const vcol = vcStyles[s.verdict_class]||'#9ca3af';
+  const bstyle = {{
+    bullish:'background:#052e16;color:#4ade80;border:1px solid #16a34a',
+    bearish:'background:#2d0000;color:#f87171;border:1px solid #b91c1c',
+    neutral:'background:#1c1917;color:#d1d5db;border:1px solid #374151',
+    alert:  'background:#1c1400;color:#fbbf24;border:1px solid #92400e',
+  }};
+  const badges = s.signals.map(sig =>
+    `<span class="signal-badge" style="${{bstyle[sig.type]||bstyle.neutral}}">${{sig.label}}</span>`
+  ).join('');
+
+  panel.innerHTML = `
+    <div class="cp-header">
+      <div>
+        <div class="cp-ticker">${{s.ticker}}</div>
+        <div class="cp-name">${{s.name}} · ${{s.sector}}</div>
+      </div>
+      <button class="cp-close" onclick="closeChartPane()">✕</button>
+    </div>
+    <div class="cp-price-row">
+      <span class="cp-price">${{s.price.toFixed(2)}}฿</span>
+      <span class="cp-change" style="color:${{cc}}">${{fmtChg(s.change,s.change_pct)}}</span>
+    </div>
+    <div class="cp-ohlc">
+      <div class="ohlc-item"><div class="ohlc-label">เปิด</div><div class="ohlc-val">${{s.open.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">สูงสุด</div><div class="ohlc-val" style="color:#22c55e">${{s.high.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">ต่ำสุด</div><div class="ohlc-val" style="color:#ef4444">${{s.low.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">ปริมาณ</div><div class="ohlc-val">${{Number(s.volume_k).toLocaleString()}}K</div></div>
+    </div>
+    <div>
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:.35rem">กราฟ Intraday (5 นาที)</div>
+      <div class="chart-container">
+        <div class="chart-loading" id="chartLoading">กำลังโหลดกราฟ...</div>
+        <canvas id="intradayChart" style="display:none"></canvas>
+      </div>
+    </div>
+    <div style="font-size:.72rem;color:var(--muted);margin-bottom:.35rem">กราฟ 30 วัน</div>
+    <div class="chart-container">
+      <canvas id="historyChart"></canvas>
+    </div>
+    <div class="mtf-section" id="mtfSection">
+      <div class="mtf-title">📐 Multi-Timeframe Trend <span class="mtf-conf" id="mtfConfluence">กำลังวิเคราะห์...</span></div>
+      <table class="mtf-table" id="mtfTable">
+        <thead><tr><th>TF</th><th>Trend</th><th>RSI</th><th>MACD</th><th>EMA</th></tr></thead>
+        <tbody id="mtfBody">
+          <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:.6rem">⏳ กำลังโหลด 5m / 15m / 30m...</td></tr>
+        </tbody>
+      </table>
+    </div>
+    ${{renderFundBT(s)}}
+    <div class="cp-signals">${{badges}}</div>
+    <div class="cp-indicators">
+      <div class="ohlc-item"><div class="ohlc-label">RSI(14)</div><div class="ohlc-val" style="color:${{s.rsi<30?'#22c55e':s.rsi>70?'#ef4444':'#3b82f6'}}">${{s.rsi}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">MACD Hist</div><div class="ohlc-val" style="color:${{s.macd_histogram>0?'#22c55e':'#ef4444'}}">${{s.macd_histogram>=0?'+':''}}${{s.macd_histogram.toFixed(4)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">BB Upper</div><div class="ohlc-val">${{s.bb_upper.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">BB Lower</div><div class="ohlc-val">${{s.bb_lower.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">MA20</div><div class="ohlc-val">${{s.ma20.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">MA50</div><div class="ohlc-val">${{s.ma50.toFixed(2)}}</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">Vol Ratio</div><div class="ohlc-val">${{s.volume_ratio}}x</div></div>
+      <div class="ohlc-item"><div class="ohlc-label">Mom 10d</div><div class="ohlc-val" style="color:${{s.momentum_10d>=0?'#22c55e':'#ef4444'}}">${{s.momentum_10d>=0?'+':''}}${{s.momentum_10d.toFixed(2)}}%</div></div>
+    </div>
+    ${{renderCpSummaryHTML(s.summary, vcol)}}
+  `;
+
+  // 30-day history chart
+  drawHistoryChart(s.sparkline, s.ticker);
+  // Intraday chart (fetch live)
+  fetchIntradayChart(s.ticker + '.BK');
+  // Multi-timeframe trend analysis (fetch live)
+  analyzeMultiTimeframe(s.ticker + '.BK');
+}}
+
+function closeChartPane() {{
+  document.getElementById('chartPane').classList.remove('open');
+  selectedTicker = null;
+  if (chartInstance) {{ chartInstance.destroy(); chartInstance = null; }}
+  renderTable();
+  renderCards();
+}}
+
+// ── CHART.JS: 30-DAY HISTORY ─────────────────────────────────
+function drawHistoryChart(data, ticker) {{
+  const canvas = document.getElementById('historyChart');
+  if (!canvas) return;
+  if (chartInstance) chartInstance.destroy();
+  const labels = data.map((_,i) => `D-${{data.length-1-i}}`);
+  const color = data[data.length-1] >= data[0] ? '#22c55e' : '#ef4444';
+  chartInstance = new Chart(canvas, {{
+    type: 'line',
+    data: {{
+      labels,
+      datasets: [{{
+        label: ticker + ' 30D',
+        data,
+        borderColor: color,
+        backgroundColor: color + '18',
+        borderWidth: 2,
+        pointRadius: 0,
+        fill: true,
+        tension: 0.3,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{legend:{{display:false}},tooltip:{{mode:'index',intersect:false}}}},
+      scales: {{
+        x: {{display:false}},
+        y: {{
+          grid: {{color:'#1a1a2a'}},
+          ticks: {{color:'#6b7280',font:{{size:10}}}},
+        }}
+      }}
+    }}
+  }});
+}}
+
+// ── CHART.JS: INTRADAY ────────────────────────────────────────
+let intradayChart = null;
+async function fetchIntradayChart(symbol) {{
+  const loading = document.getElementById('chartLoading');
+  const canvas  = document.getElementById('intradayChart');
+  if (!loading || !canvas) return;
+
+  const urls = [
+    `/api/intraday?symbol=${{encodeURIComponent(symbol)}}&range=1d&interval=5m`,
+  ];
+
+  let result = null;
+  for (const url of urls) {{
+    try {{
+      const r = await fetch(url, {{headers:{{'Accept':'application/json'}}}});
+      if (!r.ok) continue;
+      const d = await r.json();
+      result = d?.chart?.result?.[0];
+      if (result) break;
+    }} catch {{}}
+  }}
+
+  if (!result) {{
+    loading.textContent = 'ไม่สามารถโหลดกราฟ Intraday ได้ (CORS) — ดูกราฟ 30 วันด้านล่าง';
+    return;
+  }}
+
+  const timestamps = result.timestamp || [];
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const labels = timestamps.map(ts => {{
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString('th-TH', {{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Bangkok'}});
+  }});
+  const prices = closes.map(v => v != null ? +v.toFixed(2) : null);
+
+  loading.style.display = 'none';
+  canvas.style.display = 'block';
+
+  if (intradayChart) intradayChart.destroy();
+  const first = prices.find(v => v != null) || 0;
+  const last  = [...prices].reverse().find(v => v != null) || 0;
+  const color = last >= first ? '#22c55e' : '#ef4444';
+
+  intradayChart = new Chart(canvas, {{
+    type: 'line',
+    data: {{
+      labels,
+      datasets: [{{
+        data: prices,
+        borderColor: color,
+        backgroundColor: color + '15',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: true,
+        tension: 0.2,
+        spanGaps: true,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{display:false}},
+        tooltip: {{
+          mode:'index',intersect:false,
+          callbacks: {{label: ctx => `${{ctx.parsed.y?.toFixed(2)}} ฿`}}
+        }}
+      }},
+      scales: {{
+        x: {{
+          ticks: {{color:'#6b7280',font:{{size:9}},maxTicksLimit:8}},
+          grid: {{color:'#1a1a2a'}},
+        }},
+        y: {{
+          position:'right',
+          ticks: {{color:'#6b7280',font:{{size:9}}}},
+          grid: {{color:'#1a1a2a'}},
+        }}
+      }}
+    }}
+  }});
+}}
+
+// ── MULTI-TIMEFRAME TREND ANALYSIS ────────────────────────────
+// Fetch 5m / 15m / 30m candles from Yahoo and compute trend confluence
+async function fetchTF(symbol, range, interval) {{
+  const urls = [
+    `/api/intraday?symbol=${{encodeURIComponent(symbol)}}&range=${{range}}&interval=${{interval}}`,
+  ];
+  for (const url of urls) {{
+    try {{
+      const r = await fetch(url, {{headers:{{'Accept':'application/json'}}}});
+      if (!r.ok) continue;
+      const d = await r.json();
+      const res = d?.chart?.result?.[0];
+      const closes = res?.indicators?.quote?.[0]?.close?.filter(v => v != null) || [];
+      if (closes.length >= 26) return closes;
+    }} catch {{}}
+  }}
+  return null;
+}}
+
+function analyzeTF(closes) {{
+  const rsi = calcRSI(closes);
+  const {{hist}} = calcMACD(closes);
+  const ema9  = calcEMA(closes, 9);
+  const ema21 = calcEMA(closes, 21);
+  const e9 = ema9[ema9.length-1], e21 = ema21[ema21.length-1];
+  // Trend score: combine EMA cross, MACD, RSI bias
+  let score = 0;
+  if (e9 > e21) score++; else score--;
+  if (hist > 0) score++; else score--;
+  if (rsi >= 55) score++; else if (rsi <= 45) score--;
+  const trend = score >= 2 ? 'up' : score <= -2 ? 'down' : 'flat';
+  return {{rsi, hist, emaCross: e9 >= e21 ? 'GC' : 'DC', trend, score}};
+}}
+
+async function analyzeMultiTimeframe(symbol) {{
+  const body = document.getElementById('mtfBody');
+  const conf = document.getElementById('mtfConfluence');
+  if (!body) return;
+  const TFS = [
+    {{label:'5m',  range:'5d',  interval:'5m'}},
+    {{label:'15m', range:'5d',  interval:'15m'}},
+    {{label:'30m', range:'1mo', interval:'30m'}},
+  ];
+  const results = await Promise.all(TFS.map(tf => fetchTF(symbol, tf.range, tf.interval)));
+
+  const trendLabel = {{up:'▲ ขาขึ้น', down:'▼ ขาลง', flat:'— ทรงตัว'}};
+  let upCount = 0, downCount = 0, valid = 0;
+  const rows = TFS.map((tf, i) => {{
+    const closes = results[i];
+    if (!closes) {{
+      return `<tr><td>${{tf.label}}</td><td colspan="4" style="color:var(--muted)">ไม่มีข้อมูล</td></tr>`;
+    }}
+    valid++;
+    const a = analyzeTF(closes);
+    if (a.trend === 'up') upCount++; else if (a.trend === 'down') downCount++;
+    const rsiCol = a.rsi < 30 ? '#22c55e' : a.rsi > 70 ? '#ef4444' : '#3b82f6';
+    const macdCol = a.hist > 0 ? '#22c55e' : '#ef4444';
+    return `<tr>
+      <td>${{tf.label}}</td>
+      <td><span class="mtf-trend ${{a.trend}}">${{trendLabel[a.trend]}}</span></td>
+      <td style="color:${{rsiCol}};font-weight:700">${{a.rsi}}</td>
+      <td style="color:${{macdCol}};font-weight:700">${{a.hist>=0?'+':''}}${{a.hist.toFixed(3)}}</td>
+      <td style="color:${{a.emaCross==='GC'?'#22c55e':'#ef4444'}}">${{a.emaCross}}</td>
+    </tr>`;
+  }}).join('');
+  body.innerHTML = rows;
+
+  if (conf) {{
+    if (valid === 0) {{
+      conf.textContent = 'โหลดข้อมูลไม่ได้ (CORS)';
+      conf.className = 'mtf-conf mix';
+    }} else if (upCount === valid) {{
+      conf.textContent = `${{upCount}}/${{valid}} Bullish — สอดคล้องกันทุกกรอบ`;
+      conf.className = 'mtf-conf bull';
+    }} else if (downCount === valid) {{
+      conf.textContent = `${{downCount}}/${{valid}} Bearish — สอดคล้องกันทุกกรอบ`;
+      conf.className = 'mtf-conf bear';
+    }} else {{
+      conf.textContent = `▲${{upCount}} ▼${{downCount}} — สัญญาณผสม`;
+      conf.className = 'mtf-conf mix';
+    }}
+  }}
+}}
+
+// ── VIEW SWITCH ───────────────────────────────────────────────
+function switchView(view, btn) {{
+  currentView = view;
+  document.querySelectorAll('.view-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('reportView').classList.toggle('hidden', view !== 'report');
+  document.getElementById('cardsView').classList.toggle('hidden', view !== 'cards');
+  if (view === 'report') renderTable(); else renderCards();
+}}
+
+// ── FILTERS ───────────────────────────────────────────────────
+function filterVerdict(v, btn) {{
+  verdictFilter = v;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (currentView === 'report') renderTable(); else renderCards();
+}}
+
+function filterSector(btn) {{
+  sectorFilter = btn.dataset.sector;
+  document.querySelectorAll('.cat-tab').forEach(b => b.classList.remove('active'));
+  document.getElementById('catAll').classList.remove('active');
+  btn.classList.add('active');
+  if (currentView === 'report') renderTable(); else renderCards();
+}}
+
+function filterSectorAll(btn) {{
+  sectorFilter = 'all';
+  document.querySelectorAll('.cat-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (currentView === 'report') renderTable(); else renderCards();
+}}
+
+// ── TABLE SORT ────────────────────────────────────────────────
+function sortTable(col) {{
+  if (sortCol === col) sortDir *= -1;
+  else {{ sortCol = col; sortDir = col === 'ticker' ? 1 : -1; }}
+  document.querySelectorAll('.report-table th').forEach(th => {{
+    th.classList.toggle('sorted', th.dataset.col === col);
+  }});
+  renderTable();
+}}
+
+// ── MODAL ─────────────────────────────────────────────────────
+function openModal() {{
+  document.getElementById('stockModal').style.display = 'flex';
+  document.getElementById('tickerInput').focus();
+  renderCustomList();
+}}
+function closeModal() {{
+  document.getElementById('stockModal').style.display = 'none';
+  document.getElementById('addStatus').textContent = '';
+  document.getElementById('tickerInput').value = '';
+  document.getElementById('suggestions').innerHTML = '';
+}}
+function refreshPage() {{
+  const btn = document.getElementById('refreshBtn');
+  btn.textContent = '⟳ กำลังโหลด...';
+  btn.disabled = true;
+  window.location.reload(true);
+}}
+
+async function refreshLive() {{
+  const btn = document.getElementById('refreshBtn');
+  const liveLabel = document.getElementById('liveLabel');
+  const liveDot = document.getElementById('liveDot');
+  const lastUpdated = document.getElementById('lastUpdated');
+  if (btn) {{ btn.textContent = '⟳ กำลังโหลด...'; btn.disabled = true; }}
+
+  const symbols = [...new Set(allStocks.filter(s => !s.is_custom).map(s => s.ticker))];
+  if (!symbols.length) {{
+    if (btn) {{ btn.textContent = '🔄 Refresh Live'; btn.disabled = false; }}
+    return;
+  }}
+
+  try {{
+    const resp = await fetch(`/api/batch?symbols=${{symbols.join(',')}}`);
+    if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
+    const liveData = await resp.json();
+
+    if (Array.isArray(liveData)) {{
+      liveData.forEach(d => {{
+        if (d.error) return;
+        const idx = allStocks.findIndex(s => s.ticker === d.symbol);
+        if (idx < 0) return;
+        const s = allStocks[idx];
+        allStocks[idx] = {{
+          ...s,
+          price: d.price ?? s.price,
+          change: d.change ?? s.change,
+          change_pct: d.change_pct ?? s.change_pct,
+          open: d.open ?? s.open,
+          high: d.high ?? s.high,
+          low: d.low ?? s.low,
+          volume_k: d.volume ? Math.round(d.volume / 1000) : s.volume_k,
+          rsi: d.rsi ?? s.rsi,
+          macd_histogram: d.macd_histogram ?? s.macd_histogram,
+          macd_line: d.macd_line ?? s.macd_line,
+          macd_signal: d.macd_signal ?? s.macd_signal,
+          bb_upper: d.bb_upper ?? s.bb_upper,
+          bb_mid: d.bb_mid ?? s.bb_mid,
+          bb_lower: d.bb_lower ?? s.bb_lower,
+          ma20: d.ma20 ?? s.ma20,
+          ma50: d.ma50 ?? s.ma50,
+          volume_ratio: d.volume_ratio ?? s.volume_ratio,
+          momentum_10d: d.momentum_10d ?? s.momentum_10d,
+        }};
+      }});
+    }}
+
+    renderAll();
+    refreshOverview();
+    refreshMovers();
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2,'0');
+    const mm = String(now.getMinutes()).padStart(2,'0');
+    if (lastUpdated) lastUpdated.textContent = `อัปเดต ${{hh}}:${{mm}} น.`;
+    if (liveLabel) liveLabel.textContent = 'Live';
+    if (liveDot) liveDot.style.color = '#22c55e';
+  }} catch (err) {{
+    console.warn('refreshLive error:', err);
+    if (liveLabel) liveLabel.textContent = 'Offline';
+    if (liveDot) liveDot.style.color = '#ef4444';
+  }} finally {{
+    if (btn) {{ btn.textContent = '🔄 Refresh Live'; btn.disabled = false; }}
+  }}
+}}
+
+// ── LOCALSTORAGE WATCHLIST ────────────────────────────────────
+const LS_KEY = 'set_custom_watchlist_v2';
+const getCustomList = () => {{ try{{ return JSON.parse(localStorage.getItem(LS_KEY)||'[]'); }}catch{{return[];}} }};
+const saveCustomList = list => localStorage.setItem(LS_KEY, JSON.stringify(list));
+
+const POPULAR = ['MINT','SCC','DELTA','PTTGC','IVL','BH','CENTEL','KTC','OSP','HMPRO',
+  'TU','BEM','CPN','GLOBAL','BJC','ERW','MAJOR','MTC','SAWAD','TIDLOR',
+  'GPSC','RATCH','EGCO','BANPU','IRPC','TOP','SPRC',
+  'KKP','TISCO','TCAP','DTAC','JMT','AEONTS','NOBLE','SPALI','LH','AP','EA'];
+
+// Sector lookup for SET stocks (Thai names)
+const SET_SECTORS = {{
+  // พลังงาน
+  PTT:'พลังงาน',PTTEP:'พลังงาน',GULF:'พลังงาน',GPSC:'พลังงาน',RATCH:'พลังงาน',
+  EGCO:'พลังงาน',BANPU:'พลังงาน',IRPC:'พลังงาน',TOP:'พลังงาน',SPRC:'พลังงาน',
+  PTTGC:'พลังงาน',EA:'พลังงาน',BCPG:'พลังงาน',SUSCO:'พลังงาน',
+  // การเงิน
+  KBANK:'การเงิน',SCB:'การเงิน',BBL:'การเงิน',KTB:'การเงิน',BAY:'การเงิน',
+  TMB:'การเงิน',TISCO:'การเงิน',KKP:'การเงิน',TCAP:'การเงิน',LHFG:'การเงิน',
+  KTC:'การเงิน',AEONTS:'การเงิน',MTC:'การเงิน',SAWAD:'การเงิน',TIDLOR:'การเงิน',
+  JMT:'การเงิน',
+  // โทรคมนาคม
+  ADVANC:'โทรคมนาคม',TRUE:'โทรคมนาคม',DTAC:'โทรคมนาคม',INTUCH:'โทรคมนาคม',
+  // คมนาคม
+  AOT:'คมนาคม',BEM:'คมนาคม',BTS:'คมนาคม',AAV:'คมนาคม',THAI:'คมนาคม',
+  // พาณิชย์
+  CPALL:'พาณิชย์',HMPRO:'พาณิชย์',GLOBAL:'พาณิชย์',BJC:'พาณิชย์',MAKRO:'พาณิชย์',
+  OSP:'พาณิชย์',COM7:'พาณิชย์',
+  // อสังหาริมทรัพย์
+  LH:'อสังหาริมทรัพย์',AP:'อสังหาริมทรัพย์',SPALI:'อสังหาริมทรัพย์',
+  NOBLE:'อสังหาริมทรัพย์',CPN:'อสังหาริมทรัพย์',
+  // สุขภาพ
+  BDMS:'สุขภาพ',BH:'สุขภาพ',BCH:'สุขภาพ',RJH:'สุขภาพ',CHG:'สุขภาพ',
+  // อาหารและเครื่องดื่ม
+  MINT:'อาหาร',TU:'อาหาร',CPF:'อาหาร',OSP:'อาหาร',CBG:'อาหาร',
+  // วัสดุก่อสร้าง/อุตสาหกรรม
+  SCC:'วัสดุ',SCCC:'วัสดุ',DCC:'วัสดุ',
+  // อิเล็กทรอนิกส์/เทคโนโลยี
+  DELTA:'เทคโนโลยี',HANA:'เทคโนโลยี',KCE:'เทคโนโลยี',
+  // ปิโตรเคมี
+  IVL:'ปิโตรเคมี',
+  // บันเทิง/ท่องเที่ยว
+  CENTEL:'ท่องเที่ยว',ERW:'ท่องเที่ยว',MAJOR:'ท่องเที่ยว',
+}};
+
+// Map Yahoo Finance English sector → Thai
+const YAHOO_SECTOR_MAP = {{
+  'Energy':'พลังงาน','Financial Services':'การเงิน','Financials':'การเงิน',
+  'Communication Services':'โทรคมนาคม','Industrials':'คมนาคม',
+  'Consumer Defensive':'พาณิชย์','Consumer Cyclical':'พาณิชย์',
+  'Real Estate':'อสังหาริมทรัพย์','Healthcare':'สุขภาพ',
+  'Basic Materials':'วัสดุ','Technology':'เทคโนโลยี',
+  'Utilities':'สาธารณูปโภค',
+}};
+
+async function fetchSector(ticker) {{
+  // 1. Try local lookup first
+  if (SET_SECTORS[ticker]) return SET_SECTORS[ticker];
+  // 2. Try Yahoo Finance quoteSummary
+  const urls = [
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${{ticker}}.BK?modules=assetProfile`,
+    `https://corsproxy.io/?url=https://query1.finance.yahoo.com/v10/finance/quoteSummary/${{ticker}}.BK?modules=assetProfile`,
+  ];
+  for (const url of urls) {{
+    try {{
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      const j = await r.json();
+      const eng = j?.quoteSummary?.result?.[0]?.assetProfile?.sector;
+      if (eng) return YAHOO_SECTOR_MAP[eng] || eng;
+    }} catch{{}}
+  }}
+  return 'อื่นๆ';
+}}
+
+function onTickerInput(val) {{
+  const v = val.toUpperCase().trim();
+  const box = document.getElementById('suggestions');
+  if (!v) {{ box.innerHTML=''; return; }}
+  const matches = POPULAR.filter(t => t.startsWith(v) && t !== v).slice(0, 6);
+  box.innerHTML = matches.map(t =>
+    `<span class="sug-item" onclick="document.getElementById('tickerInput').value='${{t}}';document.getElementById('suggestions').innerHTML='';addCustomStock()">${{t}}</span>`
+  ).join('');
+}}
+
+async function addCustomStock() {{
+  const raw = document.getElementById('tickerInput').value.trim().toUpperCase();
+  if (!raw) return;
+  const ticker = raw.replace('.BK','');
+  const list = getCustomList();
+  const status = document.getElementById('addStatus');
+  if (list.includes(ticker)) {{ status.textContent=`${{ticker}} อยู่ในรายการแล้ว`; status.style.color='#fbbf24'; return; }}
+  status.textContent = `กำลังดึงข้อมูล ${{ticker}}...`; status.style.color='#94a3b8';
+  const ok = await fetchAndMergeCustomStock(ticker);
+  if (ok) {{
+    list.push(ticker); saveCustomList(list); renderCustomList();
+    document.getElementById('tickerInput').value = '';
+    document.getElementById('suggestions').innerHTML = '';
+    status.textContent = `✓ เพิ่ม ${{ticker}} เข้ารายการแล้ว`; status.style.color='#22c55e';
+  }} else {{
+    status.textContent = `ไม่พบข้อมูล ${{ticker}} — ตรวจสอบ ticker`; status.style.color='#ef4444';
+  }}
+}}
+function quickAdd(t) {{ document.getElementById('tickerInput').value=t; addCustomStock(); }}
+
+// ── CUSTOM STOCK (browser-side) ───────────────────────────────
+function calcRSI(c,p=14){{if(c.length<p+1)return 50;let g=0,l=0;for(let i=c.length-p;i<c.length;i++){{const d=c[i]-c[i-1];if(d>0)g+=d;else l-=d;}}const ag=g/p,al=l/p;if(al===0)return 100;return+(100-100/(1+ag/al)).toFixed(2);}}
+function calcEMA(a,s){{const k=2/(s+1);let e=a[0];const o=[e];for(let i=1;i<a.length;i++){{e=a[i]*k+e*(1-k);o.push(e);}}return o;}}
+function calcMACD(c){{const e12=calcEMA(c,12),e26=calcEMA(c,26);const m=e12.map((v,i)=>v-e26[i]);const sig=calcEMA(m,9);return {{hist:+(m[m.length-1]-sig[sig.length-1]).toFixed(4)}};}}
+function calcBB(c,p=20){{const s=c.slice(-p);const mn=s.reduce((a,b)=>a+b,0)/p;const std=Math.sqrt(s.reduce((a,b)=>a+(b-mn)**2,0)/p);return {{upper:+(mn+2*std).toFixed(2),mid:+mn.toFixed(2),lower:+(mn-2*std).toFixed(2)}};}}
+function calcBacktest(closes, hold=5) {{
+  if (closes.length < 40) return {{win_rate:null, trades:0, avg_return:null, hold}};
+  const e9 = calcEMA(closes, 9), e21 = calcEMA(closes, 21);
+  let wins=0, total=0, sum=0;
+  for (let i=25; i<closes.length-hold-1; i++) {{
+    const r = calcRSI(closes.slice(0, i+1));
+    const bull = e9[i] > e21[i] && r >= 50;
+    const bear = e9[i] < e21[i] && r <= 50;
+    if (!bull && !bear) continue;
+    const fwd = (closes[i+hold]-closes[i])/closes[i]*100;
+    const dir = bull ? fwd : -fwd;
+    sum += dir; total++; if (dir > 0) wins++;
+  }}
+  if (!total) return {{win_rate:null, trades:0, avg_return:null, hold}};
+  return {{win_rate:+(wins/total*100).toFixed(1), trades:total, avg_return:+(sum/total).toFixed(2), hold}};
+}}
+
+async function fetchYahoo(symbol) {{
+  const urls = [
+    `/api/intraday?symbol=${{encodeURIComponent(symbol)}}&range=3mo&interval=1d`,
+  ];
+  for (const url of urls) {{
+    try {{ const r=await fetch(url,{{headers:{{'Accept':'application/json'}}}});if(!r.ok)continue;const d=await r.json();const res=d?.chart?.result?.[0];if(res)return res; }}catch{{}}
+  }}
+  return null;
+}}
+
+// ── FETCH + MERGE custom stock into allStocks ─────────────────
+async function fetchAndMergeCustomStock(ticker) {{
+  const [result, sector] = await Promise.all([
+    fetchYahoo(ticker+'.BK'),
+    fetchSector(ticker),
+  ]);
+  if (!result) return false;
+  const closes = result.indicators?.quote?.[0]?.close?.filter(v=>v!=null)||[];
+  const vols   = result.indicators?.quote?.[0]?.volume?.filter(v=>v!=null)||[];
+  const opens  = result.indicators?.quote?.[0]?.open?.filter(v=>v!=null)||[];
+  const highs  = result.indicators?.quote?.[0]?.high?.filter(v=>v!=null)||[];
+  const lows   = result.indicators?.quote?.[0]?.low?.filter(v=>v!=null)||[];
+  if (closes.length < 20) return false;
+
+  const price     = +closes[closes.length-1].toFixed(2);
+  const prev      = closes[closes.length-2];
+  const change    = +(price-prev).toFixed(2);
+  const changePct = +((change/prev)*100).toFixed(2);
+  const openP     = +opens[opens.length-1].toFixed(2);
+  const highP     = +highs.slice(-1)[0].toFixed(2);
+  const lowP      = +lows.slice(-1)[0].toFixed(2);
+  const rsi       = calcRSI(closes);
+  const {{hist:macdHist}} = calcMACD(closes);
+  const bb        = calcBB(closes);
+  const avgVol    = vols.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const lastVol   = vols[vols.length-1];
+  const volRatio  = +(lastVol/avgVol).toFixed(2);
+  const volK      = Math.round(lastVol/1000);
+  const valM      = +(lastVol*price/1e6).toFixed(2);
+  const mom10     = closes.length>10 ? +((price-closes[closes.length-11])/closes[closes.length-11]*100).toFixed(2) : 0;
+  const ma20      = +(closes.slice(-20).reduce((a,b)=>a+b,0)/20).toFixed(2);
+  const ma50      = closes.length>=50 ? +(closes.slice(-50).reduce((a,b)=>a+b,0)/50).toFixed(2) : ma20;
+  const spark     = closes.slice(-30).map(v=>+v.toFixed(2));
+
+  let score=0, signals=[];
+  if(rsi<30){{score+=2;signals.push({{type:'bullish',label:'RSI Oversold',detail:`RSI=${{rsi}}`}});}}
+  else if(rsi>70){{score-=2;signals.push({{type:'bearish',label:'RSI Overbought',detail:`RSI=${{rsi}}`}});}}
+  else signals.push({{type:'neutral',label:'RSI Neutral',detail:`RSI=${{rsi}}`}});
+  if(macdHist>0){{score+=1;signals.push({{type:'bullish',label:'MACD+',detail:`${{macdHist}}`}});}}
+  else{{score-=1;signals.push({{type:'bearish',label:'MACD−',detail:`${{macdHist}}`}});}}
+  if(price<=bb.lower){{score+=2;signals.push({{type:'bullish',label:'BB Lower',detail:'แตะ Lower Band'}});}}
+  else if(price>=bb.upper){{score-=2;signals.push({{type:'bearish',label:'BB Upper',detail:'แตะ Upper Band'}});}}
+  else if(price>bb.mid){{score+=1;signals.push({{type:'bullish',label:'BB Mid+',detail:'เหนือ Midline'}});}}
+  if(volRatio>2){{score+=(mom10>0?1:-1);signals.push({{type:'alert',label:'Vol Spike',detail:`${{volRatio}}x`}});}}
+  if(mom10>5){{score+=2;signals.push({{type:'bullish',label:'Mom+',detail:`+${{mom10}}%`}});}}
+  else if(mom10>2){{score+=1;signals.push({{type:'bullish',label:'Mom↑',detail:`+${{mom10}}%`}});}}
+  else if(mom10<-5){{score-=2;signals.push({{type:'bearish',label:'Mom−',detail:`${{mom10}}%`}});}}
+  else if(mom10<-2){{score-=1;signals.push({{type:'bearish',label:'Mom↓',detail:`${{mom10}}%`}});}}
+  if(ma20>ma50&&price>ma20){{score+=2;signals.push({{type:'bullish',label:'MA↑',detail:'P>MA20>MA50'}});}}
+  else if(ma20<ma50&&price<ma20){{score-=2;signals.push({{type:'bearish',label:'MA↓',detail:'P<MA20<MA50'}});}}
+
+  const vcMap=[[4,'Strong Buy','strong-buy'],[2,'Buy','buy'],[-1,'Hold','hold'],[-3,'Sell','sell'],[-999,'Strong Sell','strong-sell']];
+  let verdict='Hold', vc='hold';
+  for(const[th,v,c] of vcMap){{if(score>=th){{verdict=v;vc=c;break;}}}}
+
+  // Build 3-layer summary object (mirrors Python ai_summary structure)
+  const maScore = (volRatio>2?1:volRatio<0.6?-1:0) + (price>ma50*1.05?1:price<ma50*0.95?-1:0);
+  const coScore = (mom10>5?2:mom10>2?1:mom10<-5?-2:mom10<-2?-1:0) + ((price/ma50-1)*100>15?-1:(price/ma50-1)*100<-15?1:0);
+  const prScore = score;
+  const maNote = volRatio>2?`Fund Flow เข้า — Volume ${{volRatio}}x`:`Volume ${{volRatio}}x`;
+  const coNote = mom10>2?`Momentum +${{mom10}}% (10d) — ทิศทางบวก`:mom10<-2?`Momentum ${{mom10}}% (10d) — ทิศทางลบ`:`Momentum ${{mom10>=0?'+':''}}${{mom10}}%`;
+  const prNote = rsi<30?`RSI ${{rsi}} Oversold`:rsi>70?`RSI ${{rsi}} Overbought`:`RSI ${{rsi}} Neutral`;
+  const reasons = [];
+  if(rsi<30) reasons.push(`RSI ${{rsi}} Oversold — โอกาส Rebound`);
+  else if(rsi>70) reasons.push(`RSI ${{rsi}} Overbought — ระวังปรับฐาน`);
+  if(macdHist>0 && mom10>2) reasons.push(`MACD บวก + Momentum +${{mom10}}% — Uptrend ต่อเนื่อง`);
+  else if(macdHist<0 && mom10<-2) reasons.push(`MACD ลบ + Momentum ${{mom10}}% — Downtrend ต่อเนื่อง`);
+  if(ma20>ma50 && price>ma20) reasons.push('ราคา > MA20 > MA50 — โครงสร้าง Uptrend');
+  else if(ma20<ma50 && price<ma20) reasons.push('ราคา < MA20 < MA50 — โครงสร้าง Downtrend');
+  if(volRatio>2) reasons.push(`Volume ${{volRatio}}x — ${{mom10>0?'แรงซื้อ':'แรงขาย'}} + Volume ยืนยัน`);
+  if(!reasons.length) reasons.push(`Signal Score ${{score>=0?'+':''}}${{score}} — ${{score>0?'ภาพรวมบวก':score<0?'ภาพรวมลบ':'ทรงตัว'}}`);
+  const risks=[];
+  if(rsi>75) risks.push(`RSI ${{rsi}} สูงมาก`);
+  if(volRatio>3) risks.push(`Volume ${{volRatio}}x ผิดปกติ`);
+  if(Math.abs(mom10)>10) risks.push(`Momentum ${{mom10>=0?'+':''}}${{mom10}}% Overextended`);
+  const summary = {{
+    macro:   {{signal: maScore>0?'positive':maScore<0?'negative':'neutral', notes:[maNote]}},
+    company: {{signal: coScore>0?'positive':coScore<0?'negative':'neutral', notes:[coNote]}},
+    price:   {{signal: prScore>0?'bullish':prScore<0?'bearish':'neutral',  notes:[prNote]}},
+    signal: verdict, verdict_class: vc, score,
+    reasons: reasons.slice(0,4),
+    risk_alert: risks.length?risks.join(' · '):null,
+  }};
+
+  const stockData = {{
+    ticker, name:ticker, sector: sector || 'อื่นๆ',
+    price, open:openP, high:highP, low:lowP,
+    change, change_pct:changePct,
+    volume_k:volK, value_m:valM,
+    rsi, macd_histogram:macdHist,
+    bb_upper:bb.upper, bb_mid:bb.mid, bb_lower:bb.lower,
+    volume_ratio:volRatio, momentum_10d:mom10,
+    ma20, ma50, sparkline:spark,
+    verdict, verdict_class:vc, score, signals, summary,
+    backtest: calcBacktest(closes),
+    fundamentals: {{pe:null,pbv:null,div_yield:null,market_cap:null,eps:null}},
+    is_custom: true,
+  }};
+
+  // Merge into allStocks (replace if exists, else push)
+  const idx = allStocks.findIndex(s => s.ticker === ticker);
+  if (idx >= 0) allStocks[idx] = stockData;
+  else allStocks.push(stockData);
+
+  renderAll();
+  return true;
+}}
+
+function hideStock(ticker) {{
+  const hidden = getHiddenList();
+  if (!hidden.includes(ticker)) saveHiddenList([...hidden, ticker]);
+  if (selectedTicker === ticker) closeChartPane();
+  // if it was a custom stock, also remove it
+  if (allStocks.find(s => s.ticker === ticker && s.is_custom)) {{
+    allStocks = allStocks.filter(s => s.ticker !== ticker);
+    saveCustomList(getCustomList().filter(t => t !== ticker));
+    renderCustomList();
+  }}
+  renderAll();
+  updateRestoreBtn();
+}}
+function restoreAllStocks() {{
+  saveHiddenList([]);
+  renderAll();
+  updateRestoreBtn();
+}}
+function updateRestoreBtn() {{
+  const btn = document.getElementById('restoreBtn');
+  if (!btn) return;
+  const n = getHiddenList().length;
+  btn.style.display = n > 0 ? 'inline-flex' : 'none';
+  btn.textContent = `↩ คืนหุ้นที่ซ่อน (${{n}})`;
+}}
+function removeCustomStock(ticker) {{
+  allStocks = allStocks.filter(s => s.ticker !== ticker);
+  const list = getCustomList().filter(t => t !== ticker);
+  saveCustomList(list);
+  if (selectedTicker === ticker) closeChartPane();
+  renderAll();
+  renderCustomList();
+}}
+
+function renderCustomList() {{
+  const list=getCustomList();
+  document.getElementById('customCount').textContent=list.length?`(${{list.length}})`:'';
+  document.getElementById('customList').innerHTML=list.length
+    ? list.map(t=>`<div class="clist-item"><span>${{t}}.BK</span><button onclick="removeCustomStock('${{t}}');renderCustomList()" class="clist-remove">ลบ</button></div>`).join('')
+    : '<div style="color:#4b5563;font-size:.78rem">ยังไม่มีหุ้นที่เพิ่ม</div>';
+}}
+
+// ── CARDS: show delete button for custom stocks ───────────────
+// (injected inside renderCards via is_custom flag)
+// ── TABLE: show ✕ label for custom stocks ────────────────────
+// (ticker cell shows "เพิ่มเอง" sector tag)
+
+// ══════════════════════════════════════════════════════════════
+// 🔔 STOCK ALERT NOTIFICATION SYSTEM
+// ══════════════════════════════════════════════════════════════
+const StockAlert = {{
+  config: {{ rsi_overbought:70, rsi_oversold:30, cooldown_ms:15*60*1000 }},
+  enabled: true,
+  _lsKey: 'set_alert_cooldown_v1',
+
+  _getCooldowns() {{
+    try {{ return JSON.parse(localStorage.getItem(this._lsKey)||'{{}}'); }} catch {{ return {{}}; }}
+  }},
+  _isCooled(key) {{
+    const cd = this._getCooldowns();
+    return cd[key] && (Date.now()-cd[key]) < this.config.cooldown_ms;
+  }},
+  _setCooled(key) {{
+    const cd = this._getCooldowns();
+    cd[key] = Date.now();
+    const now = Date.now();
+    Object.keys(cd).forEach(k => {{ if(now-cd[k]>7200000) delete cd[k]; }});
+    localStorage.setItem(this._lsKey, JSON.stringify(cd));
+  }},
+
+  async init() {{
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') await Notification.requestPermission();
+    this._addToggleBtn();
+  }},
+
+  send(ticker, title, body, type) {{
+    if (!this.enabled) return;
+    if (Notification.permission !== 'granted') return;
+    const key = `${{ticker}}|${{title}}`;
+    if (this._isCooled(key)) return;
+    const icons = {{
+      buy:  'https://img.icons8.com/emoji/48/green-circle-emoji.png',
+      sell: 'https://img.icons8.com/emoji/48/red-circle-emoji.png',
+      warn: 'https://img.icons8.com/emoji/48/warning.png'
+    }};
+    const n = new Notification(`⚡ ${{ticker}} — ${{title}}`, {{ body, icon:icons[type]||icons.warn, tag:key }});
+    n.onclick = () => {{ window.focus(); n.close(); }};
+    this._setCooled(key);
+  }},
+
+  check(s) {{
+    const {{ ticker, rsi, macd_histogram:macd, verdict_class:vc, score }} = s;
+    if (rsi >= this.config.rsi_overbought)
+      this.send(ticker, 'RSI Overbought ⚠️', `RSI = ${{rsi}} · ระวังราคาสูงเกินไป`, 'sell');
+    if (rsi <= this.config.rsi_oversold)
+      this.send(ticker, 'RSI Oversold 📉', `RSI = ${{rsi}} · อาจเด้งกลับ`, 'buy');
+    if (macd > 0)
+      this.send(ticker, 'MACD Bullish 🟢', `MACD Hist = +${{macd}} · แนวโน้มขาขึ้น`, 'buy');
+    if (macd < 0)
+      this.send(ticker, 'MACD Bearish 🔴', `MACD Hist = ${{macd}} · แนวโน้มขาลง`, 'sell');
+    if (vc === 'strong-buy')
+      this.send(ticker, 'Strong Buy 🟢🟢', `Score ${{score>=0?'+':''}}${{score}} · สัญญาณซื้อแรงมาก`, 'buy');
+    if (vc === 'strong-sell')
+      this.send(ticker, 'Strong Sell 🔴🔴', `Score ${{score}} · สัญญาณขายแรงมาก`, 'sell');
+  }},
+
+  checkAll() {{ allStocks.forEach(s => this.check(s)); }},
+
+  _addToggleBtn() {{
+    if (document.getElementById('alertToggleBtn')) return;
+    const btn = document.createElement('button');
+    btn.id = 'alertToggleBtn';
+    btn.className = 'refresh-btn';
+    btn.innerHTML = '🔔 Alert ON';
+    btn.title = 'เปิด/ปิด การแจ้งเตือน RSI & MACD';
+    btn.style.cssText = 'background:#052e16;color:#22c55e;border-color:#16a34a;';
+    btn.onclick = () => {{
+      this.enabled = !this.enabled;
+      btn.innerHTML      = this.enabled ? '🔔 Alert ON' : '🔕 Alert OFF';
+      btn.style.background  = this.enabled ? '#052e16' : '#1c1917';
+      btn.style.color       = this.enabled ? '#22c55e' : '#6b7280';
+      btn.style.borderColor = this.enabled ? '#16a34a' : '#374151';
+    }};
+    const badge = document.querySelector('.header-badge');
+    if (badge) badge.insertBefore(btn, badge.firstChild);
+  }}
+}};
+
+// ── INIT ──────────────────────────────────────────────────────
+renderAll();
+StockAlert.init();
+StockAlert.checkAll();
+updateRestoreBtn();
+(async function() {{
+  const list = getCustomList();
+  for (const ticker of list) {{
+    await fetchAndMergeCustomStock(ticker);
+  }}
+  StockAlert.checkAll();
+  // Auto-load live prices + indicators on page open
+  refreshLive();
+}})();
+</script>
+</body>
+</html>"""
+    return html
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    WATCHLIST_NOW = load_watchlist()
+    print(f"SET Thailand Stock Analysis — {len(WATCHLIST_NOW)} stocks  [Source: Yahoo Finance (.BK)]")
+
+    stocks = []
+    sources_used: set[str] = set()
+
+    for ticker, info in WATCHLIST_NOW.items():
+        print(f"  {ticker} ...", end=" ", flush=True)
+        data = fetch_stock(ticker)
+        if data is None:
+            print("demo")
+            data = make_demo_data(ticker)
+            data["source"] = "Demo"
+        else:
+            print(data["source"])
+        sources_used.add(data.get("source", "unknown"))
+        sig = generate_signals(data)
+        summary = ai_summary(ticker, info["name"], data, sig, sector=info.get("sector",""))
+        stocks.append({"ticker": ticker, "info": info, "data": data, "sig": sig, "summary": summary})
+
+    stocks.sort(key=lambda s: s["sig"]["score"], reverse=True)
+
+    # Determine displayed data source label
+    if "Yahoo Finance (.BK)" in sources_used:
+        src_label = "Yahoo Finance (.BK)"
+    else:
+        src_label = "ข้อมูลสาธิต · รอ GitHub Actions อัปเดต (จ-ศ 09:30–17:00 ทุก 15 นาที)"
+
+    print(f"\nBuilding HTML ({src_label}) for {len(stocks)} stocks...")
+    html = build_html(stocks, data_source=src_label)
+    out = os.path.join(os.path.dirname(__file__), "..", "index.html")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("Done! → index.html\n")
+    print(f"{'Ticker':<10} {'Price':>8} {'Change':>8} {'RSI':>6} {'Score':>6} {'Source':<22} Verdict")
+    print("-" * 72)
+    for s in stocks:
+        d, g = s["data"], s["sig"]
+        print(f"{s['ticker']:<10} {d['price']:>8.2f} {d['change_pct']:>+7.2f}% {d['rsi']:>6.1f} {g['score']:>+6d}  {d.get('source','?'):<22} {g['verdict']}")
+
+if __name__ == "__main__":
+    main()
