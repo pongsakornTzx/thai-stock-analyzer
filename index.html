@@ -12,13 +12,7 @@
 }
 *{box-sizing:border-box;margin:0;padding:0;}
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-serif;min-height:100vh;}
-
-/* ── HEADER ── */
-.header{
-  background:linear-gradient(135deg,#0f0f1a 0%,#1a0a2e 50%,#0a1628 100%);
-  border-bottom:1px solid var(--border);padding:1.2rem 1.5rem;
-  display:flex;align-items:center;gap:1rem;
-}
+.header{background:linear-gradient(135deg,#0f0f1a 0%,#1a0a2e 50%,#0a1628 100%);border-bottom:1px solid var(--border);padding:1.2rem 1.5rem;display:flex;align-items:center;gap:1rem;}
 .header-icon{font-size:1.8rem;}
 .header-title{font-size:1.4rem;font-weight:800;color:#fff;}
 .header-sub{font-size:0.78rem;color:var(--muted);margin-top:0.15rem;}
@@ -28,8 +22,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .refresh-btn:hover{background:#2563eb;color:#fff;}
 .pulse{animation:pulse 2s infinite;}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-
-/* ── OVERVIEW BAR ── */
 .overview-bar{display:flex;flex-wrap:wrap;gap:.75rem;padding:.85rem 1.5rem;background:var(--surface);border-bottom:1px solid var(--border);align-items:center;}
 .ov-item{display:flex;flex-direction:column;align-items:center;min-width:70px;}
 .ov-label{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;}
@@ -38,8 +30,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .movers-bar{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem 1.5rem;padding:.55rem 1.5rem;background:var(--surface2);border-bottom:1px solid var(--border);font-size:.8rem;}
 .movers-label{font-size:.68rem;text-transform:uppercase;font-weight:700;}
 .mover{font-weight:600;}
-
-/* ── MAIN TOOLBAR ── */
 .toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;padding:.75rem 1.5rem;border-bottom:1px solid var(--border);background:var(--bg);}
 .view-tabs{display:flex;gap:2px;background:var(--surface2);border-radius:8px;padding:2px;}
 .view-tab{background:none;border:none;color:var(--muted);padding:.35rem .9rem;border-radius:6px;cursor:pointer;font-size:.82rem;font-weight:600;transition:all .15s;}
@@ -49,8 +39,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .filter-btn:hover,.filter-btn.active{background:#1e3a5f;border-color:var(--accent);color:#93c5fd;}
 .add-stock-btn{margin-left:auto;background:linear-gradient(135deg,#1e3a5f,#1e4080);border:1px solid var(--accent);color:#93c5fd;padding:.3rem .9rem;border-radius:999px;cursor:pointer;font-size:.82rem;font-weight:600;transition:all .2s;white-space:nowrap;}
 .add-stock-btn:hover{background:#2563eb;color:#fff;}
-
-/* ── CATEGORY TABS ── */
 .cat-bar{display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;padding:.6rem 1.5rem;background:var(--surface);border-bottom:1px solid var(--border);}
 .cat-tab{background:none;border:1px solid transparent;color:var(--muted);padding:.25rem .7rem;border-radius:999px;cursor:pointer;font-size:.78rem;display:flex;align-items:center;gap:.35rem;transition:all .15s;}
 .cat-tab:hover{border-color:var(--border);color:var(--text);}
@@ -58,39 +46,21 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .cat-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
 .cat-all{background:none;border:1px solid var(--accent);color:#93c5fd;padding:.25rem .75rem;border-radius:999px;cursor:pointer;font-size:.78rem;font-weight:600;}
 .cat-all.active{background:var(--accent);color:#fff;}
-
-/* ── MAIN CONTENT SPLIT ── */
 .content-area{display:flex;gap:0;min-height:calc(100vh - 280px);}
 .table-pane{flex:1;overflow:auto;}
-.chart-pane{
-  width:0;overflow:hidden;transition:width .3s ease;
-  background:var(--surface);border-left:1px solid var(--border);
-  flex-shrink:0;
-}
+.chart-pane{width:0;overflow:hidden;transition:width .3s ease;background:var(--surface);border-left:1px solid var(--border);flex-shrink:0;}
 .chart-pane.open{width:400px;}
-
-/* ── REPORT TABLE ── */
 .report-table{width:100%;border-collapse:collapse;font-size:.82rem;}
-.report-table th{
-  position:sticky;top:0;z-index:10;
-  background:#0d0d18;color:var(--muted);font-weight:600;
-  padding:.6rem .8rem;text-align:right;font-size:.72rem;
-  text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);
-  cursor:pointer;user-select:none;white-space:nowrap;
-}
+.report-table th{position:sticky;top:0;z-index:10;background:#0d0d18;color:var(--muted);font-weight:600;padding:.6rem .8rem;text-align:right;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;}
 .report-table th:first-child{text-align:left;}
 .report-table th:hover{color:var(--text);}
 .report-table th .sort-icon{opacity:.3;font-size:.65rem;margin-left:2px;}
 .report-table th.sorted .sort-icon{opacity:1;color:var(--accent);}
-.report-table td{
-  padding:.55rem .8rem;text-align:right;border-bottom:1px solid #1a1a26;
-  white-space:nowrap;vertical-align:middle;
-}
+.report-table td{padding:.55rem .8rem;text-align:right;border-bottom:1px solid #1a1a26;white-space:nowrap;vertical-align:middle;}
 .report-table td:first-child{text-align:left;}
 .report-table tr{cursor:pointer;transition:background .12s;}
 .report-table tr:hover{background:#16162a;}
 .report-table tr.selected{background:#1e2a4a;border-left:2px solid var(--accent);}
-
 .ticker-cell{display:flex;flex-direction:column;gap:2px;}
 .tc-top{display:flex;align-items:center;gap:.4rem;}
 .tc-sym{font-weight:800;color:#fff;font-size:.9rem;}
@@ -103,28 +73,15 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .vol-cell{color:#94a3b8;}
 .signal-cell{display:flex;flex-wrap:wrap;gap:2px;justify-content:flex-end;}
 .sig-dot{width:7px;height:7px;border-radius:50%;display:inline-block;}
-.verdict-badge{
-  font-size:.65rem;padding:.15rem .45rem;border-radius:4px;
-  font-weight:700;white-space:nowrap;
-}
+.verdict-badge{font-size:.65rem;padding:.15rem .45rem;border-radius:4px;font-weight:700;white-space:nowrap;}
 .vb-strong-buy{background:#052e16;color:#22c55e;}
 .vb-buy{background:#052e16;color:#4ade80;}
 .vb-hold{background:#1c1400;color:#fbbf24;}
 .vb-sell{background:#2d0000;color:#f87171;}
 .vb-strong-sell{background:#2d0000;color:#ef4444;}
-
-/* ── SPARKLINE IN TABLE ── */
 .spark-svg{display:block;}
-
-/* ── CARD GRID VIEW ── */
-.cards-grid{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
-  gap:1rem;padding:1.25rem 1.5rem;
-}
-.stock-card{
-  background:var(--surface);border:1px solid var(--border);border-radius:10px;
-  padding:1rem;cursor:pointer;transition:transform .2s,box-shadow .2s,border-color .2s;
-}
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;padding:1.25rem 1.5rem;}
+.stock-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem;cursor:pointer;transition:transform .2s,box-shadow .2s,border-color .2s;}
 .stock-card:hover{transform:translateY(-2px);box-shadow:0 6px 24px rgba(0,0,0,.4);border-color:#3b82f640;}
 .stock-card.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);}
 .card-header{display:flex;flex-direction:column;gap:.25rem;margin-bottom:.6rem;}
@@ -158,8 +115,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .reasons-list li{font-size:.7rem;color:#cbd5e1;padding:.15rem 0;}
 .risk-alert{margin-top:.35rem;padding:.25rem .5rem;background:#2d1a00;border:1px solid #92400e;border-radius:4px;font-size:.67rem;color:#fb923c;}
 .data-disclaimer{margin-top:.3rem;font-size:.62rem;color:#4b5563;font-style:italic;}
-
-/* ── CHART PANEL ── */
 .chart-panel{padding:1rem;display:flex;flex-direction:column;gap:.75rem;height:100%;overflow-y:auto;}
 .cp-header{display:flex;align-items:flex-start;justify-content:space-between;}
 .cp-ticker{font-size:1.3rem;font-weight:800;color:#fff;}
@@ -177,8 +132,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .cp-signals{display:flex;flex-wrap:wrap;gap:.3rem;}
 .cp-summary{font-size:.73rem;color:#94a3b8;line-height:1.6;background:var(--surface2);border-radius:6px;padding:.75rem;border-left:2px solid var(--accent);}
 .cp-indicators{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;}
-
-/* ── MULTI-TIMEFRAME ── */
 .mtf-section{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:.6rem;}
 .mtf-title{font-size:.78rem;font-weight:700;color:#e2e8f0;margin-bottom:.5rem;display:flex;align-items:center;justify-content:space-between;gap:.5rem;}
 .mtf-conf{font-size:.68rem;font-weight:700;padding:.15rem .5rem;border-radius:999px;white-space:nowrap;}
@@ -194,8 +147,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .mtf-trend.up{background:#052e16;color:#22c55e;}
 .mtf-trend.down{background:#2d0a0a;color:#f87171;}
 .mtf-trend.flat{background:#1c1917;color:#9ca3af;}
-
-/* ── FUNDAMENTALS + BACKTEST ── */
 .fund-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem;margin:.5rem 0;}
 .fund-item{background:var(--surface2);border-radius:6px;padding:.4rem;text-align:center;}
 .fund-label{font-size:.58rem;color:var(--muted);text-transform:uppercase;}
@@ -206,8 +157,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .bt-good{color:#22c55e;}
 .bt-mid{color:#fbbf24;}
 .bt-bad{color:#f87171;}
-
-/* ── ADD STOCK MODAL ── */
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(4px);z-index:1000;align-items:center;justify-content:center;}
 .modal-box{background:#13131f;border:1px solid var(--border);border-radius:14px;width:min(460px,95vw);max-height:90vh;overflow-y:auto;box-shadow:0 24px 64px rgba(0,0,0,.6);}
 .modal-header{display:flex;align-items:center;justify-content:space-between;padding:1.1rem 1.4rem;border-bottom:1px solid var(--border);font-size:.95rem;font-weight:700;color:#fff;}
@@ -233,20 +182,14 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
 .suggest-chip{background:var(--surface2);color:#94a3b8;border:1px solid var(--border);border-radius:999px;padding:.2rem .55rem;font-size:.73rem;cursor:pointer;}
 .suggest-chip:hover{background:#1e3a5f;color:#93c5fd;border-color:var(--accent);}
 .hidden{display:none!important;}
-
-/* ── FOOTER ── */
 .footer{text-align:center;padding:1.5rem;color:var(--muted);font-size:.7rem;border-top:1px solid var(--border);}
-
 @media(max-width:768px){
-  /* Header */
   .header{padding:.75rem 1rem;gap:.6rem;}
   .header-icon{font-size:1.4rem;}
   .header-title{font-size:1.05rem;}
   .header-sub{font-size:.68rem;}
   .live-badge{font-size:.65rem;padding:.2rem .55rem;}
   .refresh-btn{font-size:.65rem;padding:.2rem .55rem;}
-
-  /* Bars */
   .overview-bar{padding:.6rem .75rem;gap:.5rem;}
   .ov-item{min-width:56px;}
   .ov-label{font-size:.6rem;}
@@ -254,26 +197,16 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
   .movers-bar{font-size:.72rem;padding:.5rem .75rem;flex-wrap:wrap;gap:.3rem;}
   .cat-bar{padding:.5rem .75rem;gap:.3rem;flex-wrap:wrap;}
   .cat-tab,.cat-all{font-size:.7rem;padding:.2rem .5rem;}
-
-  /* Toolbar */
   .toolbar{padding:.6rem .75rem;flex-direction:column;align-items:flex-start;gap:.4rem;}
   .view-tabs,.filter-group{flex-wrap:wrap;gap:.25rem;}
   .filter-btn{font-size:.68rem;padding:.2rem .45rem;}
   .add-stock-btn{font-size:.75rem;padding:.3rem .75rem;width:100%;text-align:center;}
-
-  /* Table — horizontal scroll */
   .table-pane{overflow-x:auto;-webkit-overflow-scrolling:touch;}
   .report-table{min-width:640px;font-size:.72rem;}
   .report-table th,
   .report-table td{padding:.4rem .5rem;}
-
-  /* Cards */
   .cards-grid{grid-template-columns:1fr;padding:.75rem;gap:.75rem;}
-
-  /* Chart panel full-screen on mobile */
   .chart-pane.open{width:100%;position:fixed;inset:0;z-index:200;overflow-y:auto;border-radius:0;}
-
-  /* Modal */
   .modal-box{width:95vw;max-height:90vh;}
 }
 </style>
@@ -294,4 +227,134 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-s
   </div>
 </header>
 
-PLACEHOLDER_REMAINDER_TRUNCATED_FOR_LENGTH
+<!-- OVERVIEW BAR -->
+<div class="overview-bar">
+  <div class="ov-item"><span class="ov-label">หุ้นทั้งหมด</span><span class="ov-val" id="ov-total">10</span></div>
+  <div class="ov-sep"></div>
+  <div class="ov-item"><span class="ov-label">สัญญาณบวก</span><span class="ov-val" id="ov-bullish" style="color:#22c55e">4</span></div>
+  <div class="ov-item"><span class="ov-label">สัญญาณลบ</span><span class="ov-val" id="ov-bearish" style="color:#ef4444">4</span></div>
+  <div class="ov-item"><span class="ov-label">ทรงตัว</span><span class="ov-val" id="ov-neutral" style="color:#fbbf24">2</span></div>
+  <div class="ov-sep"></div>
+  <div class="ov-item"><span class="ov-label">RSI เฉลี่ย</span><span class="ov-val" id="ov-rsi" style="color:#3b82f6">47.0</span></div>
+  <div class="ov-sep"></div>
+  <div class="ov-item"><span class="ov-label">อัปเดต</span><span class="ov-val" style="font-size:.75rem">03/09/2026 14:20 (ICT)</span></div>
+</div>
+
+<!-- MOVERS BAR -->
+<div class="movers-bar" id="moversBar">
+  <span class="movers-label" style="color:#22c55e">▲ TOP ขึ้น:</span>
+  <span class="mover" style="color:#22c55e">BDMS ▲2.53%</span>&nbsp;<span class="mover" style="color:#22c55e">AOT ▲1.21%</span>&nbsp;<span class="mover" style="color:#22c55e">CPALL ▲1.10%</span>
+  &nbsp;&nbsp;
+  <span class="movers-label" style="color:#ef4444">▼ TOP ลง:</span>
+  <span class="mover" style="color:#ef4444">ADVANC ▼1.15%</span>&nbsp;<span class="mover" style="color:#ef4444">SCB ▲0.33%</span>&nbsp;<span class="mover" style="color:#ef4444">PTT ▲0.61%</span>
+</div>
+
+<!-- TOOLBAR -->
+<div class="toolbar">
+  <div class="view-tabs">
+    <button class="view-tab active" id="tabReport" onclick="switchView('report',this)">ตารางรายงาน</button>
+    <button class="view-tab" id="tabCards"  onclick="switchView('cards',this)">การ์ดวิเคราะห์</button>
+  </div>
+  <div class="filter-group" id="verdictFilters">
+    <button class="filter-btn active" onclick="filterVerdict('all',this)">ทั้งหมด</button>
+    <button class="filter-btn" onclick="filterVerdict('strong-buy',this)">Strong Buy</button>
+    <button class="filter-btn" onclick="filterVerdict('buy',this)">Buy</button>
+    <button class="filter-btn" onclick="filterVerdict('hold',this)">Hold</button>
+    <button class="filter-btn" onclick="filterVerdict('sell',this)">Sell</button>
+    <button class="filter-btn" onclick="filterVerdict('strong-sell',this)">Strong Sell</button>
+  </div>
+  <div style="display:flex;gap:.4rem;margin-left:auto;flex-wrap:wrap;">
+    <button id="restoreBtn" onclick="restoreAllStocks()" style="display:none;background:#1c1917;color:#f97316;border:1px solid #92400e;border-radius:6px;padding:.3rem .75rem;font-size:.75rem;cursor:pointer;align-items:center;gap:.3rem;">↩ คืนหุ้นที่ซ่อน</button>
+    <button class="add-stock-btn" onclick="openModal()">+ เพิ่มหุ้น</button>
+  </div>
+</div>
+
+<!-- CATEGORY TABS -->
+<div class="cat-bar" id="catBar">
+  <button class="cat-all active" id="catAll" onclick="filterSectorAll(this)">ทั้งหมด</button>
+  <button class="cat-tab" data-sector="การเงิน" onclick="filterSector(this)"><span class="cat-dot" style="background:#3b82f6"></span>การเงิน</button><button class="cat-tab" data-sector="คมนาคม" onclick="filterSector(this)"><span class="cat-dot" style="background:#8b5cf6"></span>คมนาคม</button><button class="cat-tab" data-sector="พลังงาน" onclick="filterSector(this)"><span class="cat-dot" style="background:#f59e0b"></span>พลังงาน</button><button class="cat-tab" data-sector="พาณิชย์" onclick="filterSector(this)"><span class="cat-dot" style="background:#10b981"></span>พาณิชย์</button><button class="cat-tab" data-sector="สุขภาพ" onclick="filterSector(this)"><span class="cat-dot" style="background:#ec4899"></span>สุขภาพ</button><button class="cat-tab" data-sector="โทรคมนาคม" onclick="filterSector(this)"><span class="cat-dot" style="background:#06b6d4"></span>โทรคมนาคม</button>
+</div>
+
+<!-- CONTENT SPLIT: TABLE PANE + CHART PANE -->
+<div class="content-area" id="contentArea">
+
+  <!-- TABLE PANE -->
+  <div class="table-pane" id="reportView">
+    <table class="report-table" id="reportTable">
+      <thead>
+        <tr>
+          <th onclick="sortTable('ticker')" data-col="ticker">หุ้น <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('price')" data-col="price">ล่าสุด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('change_pct')" data-col="change_pct">เปลี่ยนแปลง <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('open')" data-col="open">เปิด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('high')" data-col="high">สูงสุด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('low')" data-col="low">ต่ำสุด <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('volume_k')" data-col="volume_k">ปริมาณ<br><small>('000)</small> <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('value_m')" data-col="value_m">มูลค่า<br><small>(ลบ.)</small> <span class="sort-icon">↕</span></th>
+          <th onclick="sortTable('rsi')" data-col="rsi">RSI <span class="sort-icon">↕</span></th>
+          <th>30วัน</th>
+          <th onclick="sortTable('score')" data-col="score">สัญญาณ <span class="sort-icon">↕</span></th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+
+  <!-- CARD PANE -->
+  <div class="table-pane hidden" id="cardsView">
+    <div class="cards-grid" id="cardsGrid"></div>
+  </div>
+
+  <!-- CHART PANE (slide-in) -->
+  <div class="chart-pane" id="chartPane">
+    <div class="chart-panel" id="chartPanel"></div>
+  </div>
+</div>
+
+<footer class="footer">
+  อัปเดตล่าสุด: 03/09/2026 14:20 (ICT) · ข้อมูลจาก <strong>Yahoo Finance (.BK)</strong> · GitHub Actions อัปเดตทุก 15 นาที (ช่วงตลาด SET เปิด)<br>
+  <strong>คำเตือน:</strong> ข้อมูลนี้เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน
+</footer>
+
+<!-- ADD STOCK MODAL -->
+<div id="stockModal" class="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <div class="modal-header">เพิ่มหุ้นที่สนใจ<button onclick="closeModal()" class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="input-row">
+        <input id="tickerInput" type="text" placeholder="พิมพ์ ticker เช่น MINT, SCC, DELTA..." class="ticker-input" oninput="onTickerInput(this.value)" onkeydown="if(event.key==='Enter')addCustomStock()"/>
+        <button onclick="addCustomStock()" class="add-btn">เพิ่ม</button>
+      </div>
+      <div id="suggestions" class="suggestions"></div>
+      <div id="addStatus" class="add-status"></div>
+      <div class="custom-list-label">หุ้นที่เพิ่มไว้ <span id="customCount"></span></div>
+      <div id="customList" class="custom-list"></div>
+      <div class="suggest-popular">
+        <div class="suggest-title">หุ้นยอดนิยม SET</div>
+        <div class="suggest-chips">
+          <span class="suggest-chip" onclick="quickAdd('MINT')">MINT</span>
+          <span class="suggest-chip" onclick="quickAdd('SCC')">SCC</span>
+          <span class="suggest-chip" onclick="quickAdd('DELTA')">DELTA</span>
+          <span class="suggest-chip" onclick="quickAdd('PTTGC')">PTTGC</span>
+          <span class="suggest-chip" onclick="quickAdd('IVL')">IVL</span>
+          <span class="suggest-chip" onclick="quickAdd('BH')">BH</span>
+          <span class="suggest-chip" onclick="quickAdd('CENTEL')">CENTEL</span>
+          <span class="suggest-chip" onclick="quickAdd('KTC')">KTC</span>
+          <span class="suggest-chip" onclick="quickAdd('HMPRO')">HMPRO</span>
+          <span class="suggest-chip" onclick="quickAdd('TU')">TU</span>
+          <span class="suggest-chip" onclick="quickAdd('BEM')">BEM</span>
+          <span class="suggest-chip" onclick="quickAdd('CPN')">CPN</span>
+          <span class="suggest-chip" onclick="quickAdd('GPSC')">GPSC</span>
+          <span class="suggest-chip" onclick="quickAdd('EA')">EA</span>
+          <span class="suggest-chip" onclick="quickAdd('OSP')">OSP</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// PLACEHOLDER_SCRIPT_BODY_TO_BE_FILLED
+</script>
+</body>
+</html>
