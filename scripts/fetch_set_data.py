@@ -873,8 +873,9 @@ body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',Tahoma,sans-
     <div class="header-sub">ระบบวิเคราะห์หุ้นไทย · Data + Signal + AI Summary</div>
   </div>
   <div class="header-badge">
-    <span class="live-badge"><span class="pulse">●</span> Live Data</span>
-    <button class="refresh-btn" onclick="refreshPage()" id="refreshBtn">⟳ Refresh</button>
+    <span class="live-badge" id="liveBadge"><span class="pulse" id="liveDot">●</span> <span id="liveLabel">Live Data</span></span>
+    <span id="lastUpdated" style="font-size:.68rem;color:#6b7280;"></span>
+    <button class="refresh-btn" onclick="refreshLive()" id="refreshBtn">🔄 Refresh Live</button>
   </div>
 </header>
 
@@ -1456,9 +1457,7 @@ async function fetchIntradayChart(symbol) {{
   if (!loading || !canvas) return;
 
   const urls = [
-    `https://query1.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=1d&interval=5m`,
-    `https://query2.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=1d&interval=5m`,
-    `https://corsproxy.io/?${{encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=1d&interval=5m`)}}`,
+    `/api/intraday?symbol=${{encodeURIComponent(symbol)}}&range=1d&interval=5m`,
   ];
 
   let result = null;
@@ -1537,9 +1536,7 @@ async function fetchIntradayChart(symbol) {{
 // Fetch 5m / 15m / 30m candles from Yahoo and compute trend confluence
 async function fetchTF(symbol, range, interval) {{
   const urls = [
-    `https://query1.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=${{range}}&interval=${{interval}}`,
-    `https://query2.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=${{range}}&interval=${{interval}}`,
-    `https://corsproxy.io/?${{encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=${{range}}&interval=${{interval}}`)}}`,
+    `/api/intraday?symbol=${{encodeURIComponent(symbol)}}&range=${{range}}&interval=${{interval}}`,
   ];
   for (const url of urls) {{
     try {{
@@ -1681,6 +1678,73 @@ function refreshPage() {{
   window.location.reload(true);
 }}
 
+async function refreshLive() {{
+  const btn = document.getElementById('refreshBtn');
+  const liveLabel = document.getElementById('liveLabel');
+  const liveDot = document.getElementById('liveDot');
+  const lastUpdated = document.getElementById('lastUpdated');
+  if (btn) {{ btn.textContent = '⟳ กำลังโหลด...'; btn.disabled = true; }}
+
+  const symbols = [...new Set(allStocks.filter(s => !s.is_custom).map(s => s.ticker))];
+  if (!symbols.length) {{
+    if (btn) {{ btn.textContent = '🔄 Refresh Live'; btn.disabled = false; }}
+    return;
+  }}
+
+  try {{
+    const resp = await fetch(`/api/batch?symbols=${{symbols.join(',')}}`);
+    if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
+    const liveData = await resp.json();
+
+    if (Array.isArray(liveData)) {{
+      liveData.forEach(d => {{
+        if (d.error) return;
+        const idx = allStocks.findIndex(s => s.ticker === d.symbol);
+        if (idx < 0) return;
+        const s = allStocks[idx];
+        allStocks[idx] = {{
+          ...s,
+          price: d.price ?? s.price,
+          change: d.change ?? s.change,
+          change_pct: d.change_pct ?? s.change_pct,
+          open: d.open ?? s.open,
+          high: d.high ?? s.high,
+          low: d.low ?? s.low,
+          volume_k: d.volume ? Math.round(d.volume / 1000) : s.volume_k,
+          rsi: d.rsi ?? s.rsi,
+          macd_histogram: d.macd_histogram ?? s.macd_histogram,
+          macd_line: d.macd_line ?? s.macd_line,
+          macd_signal: d.macd_signal ?? s.macd_signal,
+          bb_upper: d.bb_upper ?? s.bb_upper,
+          bb_mid: d.bb_mid ?? s.bb_mid,
+          bb_lower: d.bb_lower ?? s.bb_lower,
+          ma20: d.ma20 ?? s.ma20,
+          ma50: d.ma50 ?? s.ma50,
+          volume_ratio: d.volume_ratio ?? s.volume_ratio,
+          momentum_10d: d.momentum_10d ?? s.momentum_10d,
+        }};
+      }});
+    }}
+
+    renderAll();
+    refreshOverview();
+    refreshMovers();
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2,'0');
+    const mm = String(now.getMinutes()).padStart(2,'0');
+    if (lastUpdated) lastUpdated.textContent = `อัปเดต ${{hh}}:${{mm}} น.`;
+    if (liveLabel) liveLabel.textContent = 'Live';
+    if (liveDot) liveDot.style.color = '#22c55e';
+  }} catch (err) {{
+    console.warn('refreshLive error:', err);
+    if (liveLabel) liveLabel.textContent = 'Offline';
+    if (liveDot) liveDot.style.color = '#ef4444';
+  }} finally {{
+    if (btn) {{ btn.textContent = '🔄 Refresh Live'; btn.disabled = false; }}
+  }}
+}}
+
 // ── LOCALSTORAGE WATCHLIST ────────────────────────────────────
 const LS_KEY = 'set_custom_watchlist_v2';
 const getCustomList = () => {{ try{{ return JSON.parse(localStorage.getItem(LS_KEY)||'[]'); }}catch{{return[];}} }};
@@ -1810,9 +1874,7 @@ function calcBacktest(closes, hold=5) {{
 
 async function fetchYahoo(symbol) {{
   const urls = [
-    `https://query1.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=3mo&interval=1d`,
-    `https://query2.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=3mo&interval=1d`,
-    `https://corsproxy.io/?${{encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${{symbol}}?range=3mo&interval=1d`)}}`,
+    `/api/intraday?symbol=${{encodeURIComponent(symbol)}}&range=3mo&interval=1d`,
   ];
   for (const url of urls) {{
     try {{ const r=await fetch(url,{{headers:{{'Accept':'application/json'}}}});if(!r.ok)continue;const d=await r.json();const res=d?.chart?.result?.[0];if(res)return res; }}catch{{}}
@@ -2068,6 +2130,8 @@ updateRestoreBtn();
     await fetchAndMergeCustomStock(ticker);
   }}
   StockAlert.checkAll();
+  // Auto-load live prices + indicators on page open
+  refreshLive();
 }})();
 </script>
 </body>
